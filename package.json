@@ -1,0 +1,24 @@
+{
+  "name": "pi-bg-tasks",
+  "version": "1.0.0",
+  "description": "Background task tools for the pi coding agent: run long commands with bg_run, results auto-push on completion, log tails, timeout kill. Two tools, ~330 tokens of context overhead.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "background-tasks",
+    "agent-tools",
+    "bun",
+    "typescript",
+    "developer-tools"
+  ],
+  "license": "MIT",
+  "repository": "github:35iter-cn/pi-bg-tasks",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
