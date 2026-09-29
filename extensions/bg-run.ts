@@ -12,6 +12,8 @@ const MAX_TIMEOUT_SECONDS = 86400;
 const THROTTLE_MS = 30_000;
 const NOTIFY_TAIL_BYTES = 4096;
 
+const SERVICE_TIMEOUT_HINT = "For long-running services (dev servers, watchers) pass timeoutSeconds: 86400; the default is a runaway guard for one-shot work (builds, tests), not a lifespan for servers.";
+
 type Task = {
 	id: string;
 	name: string;
@@ -36,7 +38,9 @@ const BgRunParams = Type.Object({
 		Type.String({ description: "Short human-readable task name; defaults to the first words of the command" }),
 	),
 	timeoutSeconds: Type.Optional(
-		Type.Number({ description: `Kill the task after this many seconds; default ${DEFAULT_TIMEOUT_SECONDS}, max ${MAX_TIMEOUT_SECONDS}` }),
+		Type.Number({
+			description: `Kill the task after this many seconds; default ${DEFAULT_TIMEOUT_SECONDS}, max ${MAX_TIMEOUT_SECONDS}. ${SERVICE_TIMEOUT_HINT}`,
+		}),
 	),
 });
 
@@ -45,6 +49,10 @@ const BgTailParams = Type.Object({
 	bytes: Type.Optional(
 		Type.Number({ description: "Max bytes of log tail to return; default 4096, max 65536" }),
 	),
+});
+
+const BgStopParams = Type.Object({
+	id: Type.String({ description: "Task id or unambiguous prefix" }),
 });
 
 function resolveLogDir(): string {
@@ -78,8 +86,10 @@ function readTail(logPath: string, bytes: number): string {
 	}
 }
 
+const TIMEOUT_HINT = " auto-killed because timeoutSeconds was reached — if this was a long-running service (dev server, watcher), restart it with a larger timeoutSeconds.";
+
 function statusLine(task: Task): string {
-	if (task.timedOut) return `timed out after ${task.timeoutSeconds}s (killed)`;
+	if (task.timedOut) return `timed out after ${task.timeoutSeconds}s (killed).${TIMEOUT_HINT}`;
 	if (task.exited) return task.exitCode === 0 ? "completed with exit code 0" : `failed with exit code ${task.exitCode}`;
 	return "running";
 }
@@ -115,6 +125,7 @@ function resolveTask(idOrPrefix: string): { task?: Task; fileId?: string; candid
 		const id = matches[0];
 		return tasks.has(id) ? { task: tasks.get(id) } : { fileId: id };
 	}
+	if (matches.length === 0) return {};
 	return { candidates: matches };
 }
 
@@ -140,12 +151,18 @@ export default function (pi: ExtensionAPI) {
 		cleanupOldLogs();
 	});
 
+	pi.on("session_shutdown", () => {
+		for (const task of tasks.values()) killTask(task);
+		tasks.clear();
+	});
+
 	pi.registerTool<typeof BgRunParams, { id: string }>({
 		name: "bg_run",
 		label: "Background Run",
 		promptSnippet: "Start a long-running command or app in the background; completion is pushed back automatically",
 		description:
-			"Start a command in the background and return immediately with an id and log path. Use for anything that keeps running or takes more than a few seconds: dev servers, watchers, builds, editors, agent CLIs, tmux/herdr launches. If the user names an underlying tool for a long-running launch, still use bg_run as the async wrapper: the named tool is the payload, bg_run is the mechanism. Quick commands belong in bash. Results are pushed on completion; do not poll.",
+			"Start a command in the background and return immediately with an id and log path. Use for anything that keeps running or takes more than a few seconds: dev servers, watchers, builds, editors, agent CLIs, tmux/herdr launches. If the user names an underlying tool for a long-running launch, still use bg_run as the async wrapper: the named tool is the payload, bg_run is the mechanism. Quick commands belong in bash. Results are pushed on completion; do not poll. " +
+			SERVICE_TIMEOUT_HINT,
 		parameters: BgRunParams,
 		async execute(_toolCallId, params: Static<typeof BgRunParams>) {
 			const dir = resolveLogDir();
@@ -186,7 +203,7 @@ export default function (pi: ExtensionAPI) {
 				task.signaled = signal !== null;
 				if (task.killTimer) clearTimeout(task.killTimer);
 				const tail = readTail(logPath, NOTIFY_TAIL_BYTES);
-				const suffix = task.timedOut ? ` timed out after ${timeoutSeconds}s (killed)` : code === 0 ? " completed with exit code 0" : ` failed with exit code ${code}`;
+				const suffix = task.timedOut ? ` timed out after ${task.timeoutSeconds}s (killed).${TIMEOUT_HINT}` : code === 0 ? " completed with exit code 0" : ` failed with exit code ${task.exitCode ?? code}`;
 				try {
 					pi.sendMessage(
 						{
@@ -207,7 +224,7 @@ export default function (pi: ExtensionAPI) {
 						text: `Started background task ${name} (${id}), pid ${child.pid}. Log: ${logPath}. Result will be pushed automatically when the task finishes; do not poll.`,
 					},
 				],
-				details: { id },
+				details: { id, pid: child.pid },
 			};
 		},
 	});
@@ -224,13 +241,14 @@ export default function (pi: ExtensionAPI) {
 			if (resolved.candidates) {
 				return {
 					content: [{ type: "text", text: `Ambiguous id prefix; candidates: ${resolved.candidates.join(", ")}` }],
+					details: { id: params.id },
 				};
 			}
 			const task = resolved.task;
-			const id = task?.id ?? resolved.fileId;
+			const id = task?.id ?? resolved.fileId ?? "";
 			const logPath = task?.logPath ?? findLogFile(id);
 			if (!id || !logPath || !existsSync(logPath)) {
-				return { content: [{ type: "text", text: `No task found for id ${params.id}` }] };
+				return { content: [{ type: "text", text: `No task found for id ${params.id}` }], details: { id: params.id } };
 			}
 			if (task && !task.exited) {
 				if (Date.now() - task.lastTailAt < THROTTLE_MS) {
@@ -241,11 +259,13 @@ export default function (pi: ExtensionAPI) {
 								text: `Task ${id} still running; its result will be pushed automatically — wait for the notification instead of polling.`,
 							},
 						],
+						details: { id },
 					};
 				}
 				task.lastTailAt = Date.now();
 				return {
 					content: [{ type: "text", text: `Task ${id} (${task.name}) running since ${new Date(task.startedAt).toISOString()}\n${readTail(logPath, bytes)}` }],
+					details: { id },
 				};
 			}
 			const status = task
@@ -253,6 +273,48 @@ export default function (pi: ExtensionAPI) {
 				: "unknown (session restarted)";
 			return {
 				content: [{ type: "text", text: `Task ${id}${task ? ` (${task.name})` : ""}: ${status}\n${readTail(logPath, bytes)}` }],
+				details: { id },
+			};
+		},
+	});
+
+	pi.registerTool<typeof BgStopParams, { id: string }>({
+		name: "bg_stop",
+		label: "Background Stop",
+		promptSnippet: "Stop a background task started in this session",
+		description:
+			"Stop a background task that bg_run started in this session. Kills the whole process group (SIGTERM, then SIGKILL after 5s). Prefer this over shelling out to kill.",
+		parameters: BgStopParams,
+		async execute(_toolCallId, params: Static<typeof BgStopParams>) {
+			const resolved = resolveTask(params.id);
+			if (resolved.candidates) {
+				return { content: [{ type: "text", text: `Ambiguous id prefix; candidates: ${resolved.candidates.join(", ")}` }], details: { id: params.id } };
+			}
+			const task = resolved.task;
+			if (!task) {
+				const id = resolved.fileId;
+				return {
+					content: [
+						{
+							type: "text",
+							text: id
+								? `Task ${id} is not running in this session (it already exited, or it was started in a previous session). Check its log: ${findLogFile(id) ?? "log cleaned up or not found"}.`
+								: `No task found for id ${params.id}`,
+						},
+					],
+					details: { id: params.id },
+				};
+			}
+			if (task.exited) {
+				return { content: [{ type: "text", text: `Task ${task.id} (${task.name}) already ${statusLine(task)}` }], details: { id: task.id } };
+			}
+			if (task.killTimer) clearTimeout(task.killTimer);
+			task.timedOut = false;
+			killTask(task);
+			tasks.delete(task.id);
+			return {
+				content: [{ type: "text", text: `Stopped background task ${task.name} (${task.id}), pid ${task.pid}. Log: ${task.logPath}` }],
+				details: { id: task.id, stopped: true },
 			};
 		},
 	});
