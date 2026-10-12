@@ -6,7 +6,7 @@ Background task tools for the [pi coding agent](https://github.com/badlogic/pi-m
 
 ## Highlights
 
-- **~450 tokens. Total.** Measured static context injection: three tool schemas + one-line prompt snippets. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools — this is **~11× lighter**.
+- **~520 tokens. Total.** Measured static context injection: three tool schemas + one-line prompt snippets. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools — this is **~9× lighter**.
 - **Three tools, nothing else.** `bg_run` + `bg_tail` + `bg_stop`. No slash commands, no widgets, no config surface, no other tools to trip over.
 - **Zero dependencies, single file.** One ~370-line TypeScript file. pi bundles `typebox` and its own API — there is nothing to install. Copy the file into your extensions folder if you don't even want a package.
 - **Fire-and-forget.** The model is told "results are pushed automatically; do not poll" — no wasted turns checking on tasks. Completion messages arrive as steering messages that trigger a turn.
@@ -102,7 +102,7 @@ No — commands run through `/bin/sh`. POSIX systems only.
 It runs arbitrary shell commands with your user's permissions, exactly like pi's built-in bash tool. The usual pi extension security note applies: review the source before installing.
 
 **Does the tool list bloat my context?**
-Measured: ~450 tokens of static injection per request — three compact tool definitions. See [Highlights](#highlights).
+Measured: ~520 tokens of static injection per request — three compact tool definitions. See [Highlights](#highlights).
 
 **Do tasks survive pi exiting?**
 No. Tasks belong to their session: a normally-closing session (including quitting pi) takes its tasks down with it. Only if pi is killed with SIGKILL / loses power — no cleanup path runs — can a process group linger; clean it up manually in the next session.

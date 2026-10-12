@@ -161,7 +161,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Background Run",
 		promptSnippet: "Start a long-running command or app in the background; completion is pushed back automatically",
 		description:
-			"Start a command in the background and return immediately with an id and log path. Use for anything that keeps running or takes more than a few seconds: dev servers, watchers, builds, editors, agent CLIs, tmux/herdr launches. If the user names an underlying tool for a long-running launch, still use bg_run as the async wrapper: the named tool is the payload, bg_run is the mechanism. Quick commands belong in bash. Results are pushed on completion; do not poll. " +
+			"Start a command in the background and return immediately with an id and log path. Use for anything that keeps running or takes more than a few seconds: dev servers, watchers, builds, deploys, network fetches, agent CLIs, tmux/herdr launches. Any command of unknown or unpredictable duration also goes here — foreground bash only for known-instant commands (git status, file reads); when in doubt, choose bg_run. Waitable invocations of agent/CLI commands (e.g. herdr agent prompt --wait) run through bg_run, never in the foreground. If the user names an underlying tool for a long-running launch, still use bg_run as the async wrapper: the named tool is the payload, bg_run is the mechanism. Results are pushed on completion; never sleep or poll in the foreground — while a task runs, do only steps that don't depend on it. " +
 			SERVICE_TIMEOUT_HINT,
 		parameters: BgRunParams,
 		async execute(_toolCallId, params: Static<typeof BgRunParams>) {
