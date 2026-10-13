@@ -1,5 +1,5 @@
 import { openSync, closeSync, readSync, statSync, readdirSync, unlinkSync, mkdirSync, existsSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +31,19 @@ type Task = {
 };
 
 const tasks = new Map<string, Task>();
+
+let resolvedShell: string | undefined;
+
+function resolveShell(): string {
+	if (resolvedShell) return resolvedShell;
+	const candidate = process.env.BG_RUN_SHELL || "bash";
+	try {
+		if (spawnSync(candidate, ["-c", "exit 0"], { stdio: "ignore" }).status === 0) {
+			return (resolvedShell = candidate);
+		}
+	} catch {}
+	return (resolvedShell = "/bin/sh");
+}
 
 const BgRunParams = Type.Object({
 	command: Type.String({ description: "Shell command to run in the background" }),
@@ -161,7 +174,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Background Run",
 		promptSnippet: "Start a long-running command or app in the background; completion is pushed back automatically",
 		description:
-			"Start a command in the background and return immediately with an id and log path. Use for anything that keeps running or takes more than a few seconds: dev servers, watchers, builds, deploys, network fetches, agent CLIs, tmux/herdr launches. Any command of unknown or unpredictable duration also goes here — foreground bash only for known-instant commands (git status, file reads); when in doubt, choose bg_run. Waitable invocations of agent/CLI commands (e.g. herdr agent prompt --wait) run through bg_run, never in the foreground. If the user names an underlying tool for a long-running launch, still use bg_run as the async wrapper: the named tool is the payload, bg_run is the mechanism. Results are pushed on completion; never sleep or poll in the foreground — while a task runs, do only steps that don't depend on it. " +
+			"Start a command in the background and return immediately with an id and log path. Commands run with bash when available, otherwise /bin/sh; the chosen shell is reported at start. Use for anything that keeps running or takes more than a few seconds: dev servers, watchers, builds, deploys, network fetches, agent CLIs, tmux/herdr launches. Any command of unknown or unpredictable duration also goes here — foreground bash only for known-instant commands (git status, file reads); when in doubt, choose bg_run. Waitable invocations of agent/CLI commands (e.g. herdr agent prompt --wait) run through bg_run, never in the foreground. If the user names an underlying tool for a long-running launch, still use bg_run as the async wrapper: the named tool is the payload, bg_run is the mechanism. Results are pushed on completion; never sleep or poll in the foreground — while a task runs, do only steps that don't depend on it. " +
 			SERVICE_TIMEOUT_HINT,
 		parameters: BgRunParams,
 		async execute(_toolCallId, params: Static<typeof BgRunParams>) {
@@ -169,9 +182,10 @@ export default function (pi: ExtensionAPI) {
 			const id = randomUUID().slice(0, 8);
 			const name = params.name?.trim() || defaultName(params.command);
 			const timeoutSeconds = Math.min(Math.max(params.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS, 1), MAX_TIMEOUT_SECONDS);
+			const shell = resolveShell();
 			const logPath = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${id}.log`);
 			const logFd = openSync(logPath, "a");
-			const child = spawn("/bin/sh", ["-c", params.command], {
+			const child = spawn(shell, ["-c", params.command], {
 				detached: true,
 				stdio: ["ignore", logFd, logFd],
 			});
@@ -221,10 +235,10 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Started background task ${name} (${id}), pid ${child.pid}. Log: ${logPath}. Result will be pushed automatically when the task finishes; do not poll.`,
+						text: `Started background task ${name} (${id}), pid ${child.pid}, shell ${shell}. Log: ${logPath}. Result will be pushed automatically when the task finishes; do not poll.`,
 					},
 				],
-				details: { id, pid: child.pid },
+				details: { id, pid: child.pid, shell },
 			};
 		},
 	});

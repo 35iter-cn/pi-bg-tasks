@@ -14,7 +14,7 @@ const OUT = join(tmpdir(), `bg-test-out-${process.pid}.json`);
 // Each scenario runs in a dedicated bun subprocess that imports the real
 // extension with a minimal fake ExtensionAPI, executes tools, and writes an
 // observable result (exit-code checks against /proc, real sleep timings).
-function scenario(body: string, out: object) {
+function scenario(body: string, out: object, env?: Record<string, string>) {
 	writeFileSync(
 		LOADER,
 		`
@@ -36,7 +36,7 @@ function scenario(body: string, out: object) {
 		await Bun.write(${JSON.stringify(OUT)}, JSON.stringify({ ...(${JSON.stringify(out)}), ...result, sent }));
 	`,
 	);
-	const run = spawnSync("bun", [LOADER], { encoding: "utf8", timeout: 30_000 });
+	const run = spawnSync("bun", [LOADER], { encoding: "utf8", timeout: 30_000, env: env ? { ...process.env, ...env } : undefined });
 	if (run.status !== 0) throw new Error(`scenario failed: ${run.stderr}`);
 	const dumped = JSON.parse(readFileSync(OUT, "utf8"));
 	rmSync(OUT, { force: true });
@@ -165,4 +165,30 @@ test("session_shutdown handler kills all session tasks", { timeout: 15_000 }, as
 		{},
 	);
 	assert.equal(r.alive, false);
+});
+test("start message reports the resolved shell and bashisms work", { timeout: 15_000 }, async () => {
+	const r = scenario(
+		`
+		const run = await bgRun({ command: 'declare -A m=([k]=v); echo \${m[k]}', name: "bashism" });
+		${wait(600)}
+		const tail = await bgTail(run.details.id);
+		result = { text: run.content[0].text, shell: run.details.shell, tail: tail.content[0].text };
+		`,
+		{},
+	);
+	assert.match(r.text, /shell (bash|\/bin\/sh)/);
+	assert.equal(r.shell, "bash");
+	assert.match(r.tail, /completed with exit code 0\nv/);
+});
+
+test("BG_RUN_SHELL override and missing-shell fallback", { timeout: 15_000 }, async () => {
+	const r = scenario(
+		`
+		const run = await bgRun({ command: "true" });
+		result = { text: run.content[0].text };
+		`,
+		{},
+		{ BG_RUN_SHELL: "/nonexistent-shell-for-test" },
+	);
+	assert.match(r.text, /shell \/bin\/sh\b/);
 });
