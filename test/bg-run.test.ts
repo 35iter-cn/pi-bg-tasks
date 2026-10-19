@@ -166,6 +166,23 @@ test("session_shutdown handler kills all session tasks", { timeout: 15_000 }, as
 	);
 	assert.equal(r.alive, false);
 });
+
+test("signal-killed task names the signal instead of 'exit code null'", { timeout: 15_000 }, async () => {
+	const r = scenario(
+		`
+		const run = await bgRun({ command: "sleep 60", name: "killed" });
+		await new Promise(res => setTimeout(res, 300));
+		for (const h of handlers.get("session_shutdown") ?? []) await h();
+		await new Promise(res => setTimeout(res, 500));
+		const pushed = sent.find(m => m.customType === "minimal-bg");
+		result = { text: pushed?.content ?? null, signal: pushed?.details?.signal ?? null };
+		`,
+		{},
+	);
+	assert.match(r.text, /killed by SIGTERM/);
+	assert.doesNotMatch(r.text, /exit code null/);
+	assert.equal(r.signal, "SIGTERM");
+});
 test("start message reports the resolved shell and bashisms work", { timeout: 15_000 }, async () => {
 	const r = scenario(
 		`

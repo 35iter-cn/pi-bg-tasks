@@ -25,7 +25,7 @@ type Task = {
 	killTimer: ReturnType<typeof setTimeout> | undefined;
 	exited: boolean;
 	exitCode: number | null;
-	signaled: boolean;
+	signal: string | null;
 	timedOut: boolean;
 	lastTailAt: number;
 };
@@ -103,7 +103,7 @@ const TIMEOUT_HINT = " auto-killed because timeoutSeconds was reached — if thi
 
 function statusLine(task: Task): string {
 	if (task.timedOut) return `timed out after ${task.timeoutSeconds}s (killed).${TIMEOUT_HINT}`;
-	if (task.exited) return task.exitCode === 0 ? "completed with exit code 0" : `failed with exit code ${task.exitCode}`;
+	if (task.exited) return task.signal ? `killed by ${task.signal}` : task.exitCode === 0 ? "completed with exit code 0" : `failed with exit code ${task.exitCode}`;
 	return "running";
 }
 
@@ -201,7 +201,7 @@ export default function (pi: ExtensionAPI) {
 				killTimer: undefined,
 				exited: false,
 				exitCode: null,
-				signaled: false,
+				signal: null,
 				timedOut: false,
 				lastTailAt: 0,
 			};
@@ -214,17 +214,17 @@ export default function (pi: ExtensionAPI) {
 			child.on("exit", (code, signal) => {
 				task.exited = true;
 				task.exitCode = code;
-				task.signaled = signal !== null;
+				task.signal = signal;
 				if (task.killTimer) clearTimeout(task.killTimer);
 				const tail = readTail(logPath, NOTIFY_TAIL_BYTES);
-				const suffix = task.timedOut ? ` timed out after ${task.timeoutSeconds}s (killed).${TIMEOUT_HINT}` : code === 0 ? " completed with exit code 0" : ` failed with exit code ${task.exitCode ?? code}`;
+				const suffix = task.timedOut ? ` timed out after ${task.timeoutSeconds}s (killed).${TIMEOUT_HINT}` : signal ? ` killed by ${signal}` : code === 0 ? " completed with exit code 0" : ` failed with exit code ${code}`;
 				try {
 					pi.sendMessage(
 						{
 							customType: "minimal-bg",
 							content: `Background task ${name} (${id})${suffix}\n${tail}`,
 							display: true,
-							details: { id, name, exitCode: code, timedOut: task.timedOut, logPath },
+							details: { id, name, exitCode: code, signal, timedOut: task.timedOut, logPath },
 						},
 						{ triggerTurn: true, deliverAs: "steer" },
 					);
