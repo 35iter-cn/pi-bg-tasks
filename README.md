@@ -8,7 +8,7 @@ Background task tools for the [pi coding agent](https://github.com/badlogic/pi-m
 
 - **~400 tokens. Total.** Measured static context injection: three tool schemas + one-line prompt snippets. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools — this is **~12× lighter**.
 - **Three tools, nothing else.** `bg_run` + `bg_tail` + `bg_stop`. No slash commands, no widgets, no config surface, no other tools to trip over.
-- **Zero dependencies, single file.** One ~370-line TypeScript file. pi bundles `typebox` and its own API — there is nothing to install. Copy the file into your extensions folder if you don't even want a package.
+- **Zero dependencies, single file.** One ~330-line TypeScript file. pi bundles `typebox` and its own API — there is nothing to install. Copy the file into your extensions folder if you don't even want a package.
 - **Fire-and-forget.** The description gives the model one decision rule (~10 seconds and up) and states that a completion arrives as a new turn — so there is nothing to wait for inside the current one. Completion messages are delivered as steering messages that trigger a turn.
 
 ## What is this?
