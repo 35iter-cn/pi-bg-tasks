@@ -12,7 +12,7 @@ const MAX_TIMEOUT_SECONDS = 86400;
 const THROTTLE_MS = 30_000;
 const NOTIFY_TAIL_BYTES = 4096;
 
-const SERVICE_TIMEOUT_HINT = "For long-running services (dev servers, watchers) pass timeoutSeconds: 86400; the default is a runaway guard for one-shot work (builds, tests), not a lifespan for servers.";
+const SERVICE_TIMEOUT_HINT = "A service meant to outlive the session needs 86400 — the default is a runaway guard, not a lifespan.";
 
 type Task = {
 	id: string;
@@ -99,7 +99,7 @@ function readTail(logPath: string, bytes: number): string {
 	}
 }
 
-const TIMEOUT_HINT = " auto-killed because timeoutSeconds was reached — if this was a long-running service (dev server, watcher), restart it with a larger timeoutSeconds.";
+const TIMEOUT_HINT = " auto-killed because timeoutSeconds was reached — if this was meant to be a long-running service, restart it with a larger timeoutSeconds.";
 
 function statusLine(task: Task): string {
 	if (task.timedOut) return `timed out after ${task.timeoutSeconds}s (killed).${TIMEOUT_HINT}`;
@@ -172,10 +172,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool<typeof BgRunParams, { id: string }>({
 		name: "bg_run",
 		label: "Background Run",
-		promptSnippet: "Start a long-running command or app in the background; completion is pushed back automatically",
+		promptSnippet: "Run anything slower than ~10 seconds in the background; returns immediately, result arrives as a new turn",
 		description:
-			"Start a command in the background and return immediately with an id and log path. Commands run with bash when available, otherwise /bin/sh; the chosen shell is reported at start. Use for anything that keeps running or takes more than a few seconds: dev servers, watchers, builds, deploys, network fetches, agent CLIs, tmux/herdr launches. Any command of unknown or unpredictable duration also goes here — foreground bash only for known-instant commands (git status, file reads); when in doubt, choose bg_run. Waitable invocations of agent/CLI commands (e.g. herdr agent prompt --wait) run through bg_run, never in the foreground. If the user names an underlying tool for a long-running launch, still use bg_run as the async wrapper: the named tool is the payload, bg_run is the mechanism. Results are pushed on completion; never sleep or poll in the foreground — while a task runs, do only steps that don't depend on it. " +
-			SERVICE_TIMEOUT_HINT,
+			"Run a shell command in the background and return at once with an id and log path. Decide by runtime, not by command type: anything likely to exceed ~10 seconds belongs here, unknown durations included; foreground bash is only for commands you know finish instantly. An extra turn is cheap, a blocked turn is not. The result arrives as a new turn when the process exits, so nothing is gained by waiting inside your turn: do independent work, or end the turn.",
 		parameters: BgRunParams,
 		async execute(_toolCallId, params: Static<typeof BgRunParams>) {
 			const dir = resolveLogDir();
@@ -235,7 +234,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Started background task ${name} (${id}), pid ${child.pid}, shell ${shell}. Log: ${logPath}. Result will be pushed automatically when the task finishes; do not poll.`,
+						text: `Started background task ${name} (${id}), pid ${child.pid}, shell ${shell}. Log: ${logPath}. Its result arrives as a new turn when the process exits; nothing done inside this turn makes it sooner.`,
 					},
 				],
 				details: { id, pid: child.pid, shell },
@@ -247,7 +246,7 @@ export default function (pi: ExtensionAPI) {
 		name: "bg_tail",
 		label: "Background Tail",
 		description:
-			"Read the status and output tail of a background task. Fallback only: results are pushed automatically on completion; do not poll. Mid-run reads throttle to once per 30s.",
+			"Read the status and output tail of a background task. Fallback only — the result arrives on its own. Mid-run reads throttle to once per 30s.",
 		parameters: BgTailParams,
 		async execute(_toolCallId, params: Static<typeof BgTailParams>) {
 			const bytes = Math.min(Math.max(params.bytes ?? 4096, 1), 65536);
@@ -270,7 +269,7 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `Task ${id} still running; its result will be pushed automatically — wait for the notification instead of polling.`,
+								text: `Task ${id} still running. Completion is a process-exit event, not a timed one, so checking again — or sleeping — makes the result arrive exactly as late. End your turn; the result comes back as a new turn.`,
 							},
 						],
 						details: { id },

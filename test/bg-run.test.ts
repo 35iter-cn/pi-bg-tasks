@@ -57,9 +57,9 @@ test("service timeout hint present in bg_run description and schema", () => {
 		`result = { desc: tools.get("bg_run").description, schema: tools.get("bg_run").parameters.properties.timeoutSeconds.description }`,
 		{},
 	);
-	assert.match(r.desc, /long-running services \(dev servers, watchers\)/);
+	assert.match(r.desc, /~10 seconds/);
 	assert.match(r.schema, /86400/);
-	assert.match(r.schema, /long-running services/);
+	assert.match(r.schema, /outlive the session/);
 });
 
 test("timed-out completion message includes root-cause hint", { timeout: 30_000 }, async () => {

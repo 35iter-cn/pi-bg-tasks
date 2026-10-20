@@ -6,10 +6,10 @@ Background task tools for the [pi coding agent](https://github.com/badlogic/pi-m
 
 ## Highlights
 
-- **~520 tokens. Total.** Measured static context injection: three tool schemas + one-line prompt snippets. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools — this is **~9× lighter**.
+- **~400 tokens. Total.** Measured static context injection: three tool schemas + one-line prompt snippets. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools — this is **~12× lighter**.
 - **Three tools, nothing else.** `bg_run` + `bg_tail` + `bg_stop`. No slash commands, no widgets, no config surface, no other tools to trip over.
 - **Zero dependencies, single file.** One ~370-line TypeScript file. pi bundles `typebox` and its own API — there is nothing to install. Copy the file into your extensions folder if you don't even want a package.
-- **Fire-and-forget.** The model is told "results are pushed automatically; do not poll" — no wasted turns checking on tasks. Completion messages arrive as steering messages that trigger a turn.
+- **Fire-and-forget.** The description gives the model one decision rule (~10 seconds and up) and states that a completion arrives as a new turn — so there is nothing to wait for inside the current one. Completion messages are delivered as steering messages that trigger a turn.
 
 ## What is this?
 
@@ -61,7 +61,7 @@ pi update --extensions
 |---|---|---|
 | `command` | string, required | Shell command to run (via `/bin/sh -c`) |
 | `name` | string, optional | Short task name; defaults to the first words of the command |
-| `timeoutSeconds` | number, optional | Kill the task after this many seconds. Default 1800, max 86400. For long-running services (dev servers, watchers) pass 86400 — the default is a runaway guard for one-shot work (builds, tests), not a lifespan for servers |
+| `timeoutSeconds` | number, optional | Kill the task after this many seconds. Default 1800, max 86400. A service meant to outlive the session needs 86400 — the default is a runaway guard, not a lifespan |
 
 Returns immediately with a task id, pid, and log path.
 
@@ -102,7 +102,7 @@ No — commands run through `/bin/sh`. POSIX systems only.
 It runs arbitrary shell commands with your user's permissions, exactly like pi's built-in bash tool. The usual pi extension security note applies: review the source before installing.
 
 **Does the tool list bloat my context?**
-Measured: ~520 tokens of static injection per request — three compact tool definitions. See [Highlights](#highlights).
+Measured: ~400 tokens of static injection per request — three compact tool definitions. See [Highlights](#highlights).
 
 **Do tasks survive pi exiting?**
 No. Tasks belong to their session: a normally-closing session (including quitting pi) takes its tasks down with it. Only if pi is killed with SIGKILL / loses power — no cleanup path runs — can a process group linger; clean it up manually in the next session.
