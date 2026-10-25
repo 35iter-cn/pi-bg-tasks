@@ -412,7 +412,8 @@ export default function (pi: ExtensionAPI) {
 					ledger.finishedAt = exit.finishedAt;
 					writeLedger(ledger);
 				}
-				if (!ledger.notified) {
+				const sameSession = !currentSessionKey || !ledger.sessionKey || ledger.sessionKey === currentSessionKey;
+				if (!ledger.notified && sameSession) {
 					const tail = readTail(ledger.logPath, NOTIFY_TAIL_BYTES);
 					const suffix = statusLine(ledger.status, ledger.exitCode, ledger.signal, ledger.timeoutSeconds);
 					try {
