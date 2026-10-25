@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { writeFileSync, readFileSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -15,9 +15,12 @@ const OUT = join(tmpdir(), `bg-test-out-${process.pid}.json`);
 // extension with a minimal fake ExtensionAPI, executes tools, and writes an
 // observable result (exit-code checks against /proc, real sleep timings).
 function scenario(body: string, out: object, env?: Record<string, string>) {
+	const dir = env?.BG_RUN_DIR ?? join(tmpdir(), `bg-test-dir-${process.pid}-${Math.random().toString(16).slice(2, 10)}`);
+	mkdirSync(dir, { recursive: true });
 	writeFileSync(
 		LOADER,
 		`
+		const dir = process.env.BG_RUN_DIR;
 		const mod = await import(${JSON.stringify(extPath)});
 		const tools = new Map(); const handlers = new Map();
 		const sent = [];
@@ -36,7 +39,7 @@ function scenario(body: string, out: object, env?: Record<string, string>) {
 		await Bun.write(${JSON.stringify(OUT)}, JSON.stringify({ ...(${JSON.stringify(out)}), ...result, sent }));
 	`,
 	);
-	const run = spawnSync("bun", [LOADER], { encoding: "utf8", timeout: 30_000, env: env ? { ...process.env, ...env } : undefined });
+	const run = spawnSync("bun", [LOADER], { encoding: "utf8", timeout: 30_000, env: { ...process.env, BG_RUN_DIR: dir, ...env } });
 	if (run.status !== 0) throw new Error(`scenario failed: ${run.stderr}`);
 	const dumped = JSON.parse(readFileSync(OUT, "utf8"));
 	rmSync(OUT, { force: true });
@@ -45,9 +48,9 @@ function scenario(body: string, out: object, env?: Record<string, string>) {
 
 const wait = (ms: number) => `await new Promise(r => setTimeout(r, ${ms}));`;
 
-test("registers three tools and two lifecycle handlers", () => {
+test("registers five tools and two lifecycle handlers", () => {
 	const r = scenario(`result = { tools: [...tools.keys()].sort(), hasStart: handlers.has("session_start"), hasShutdown: handlers.has("session_shutdown") }`, {});
-	assert.deepEqual(r.tools, ["bg_run", "bg_stop", "bg_tail"]);
+	assert.deepEqual(r.tools, ["bg_gc", "bg_list", "bg_run", "bg_stop", "bg_tail"]);
 	assert.equal(r.hasStart, true);
 	assert.equal(r.hasShutdown, true);
 });
@@ -208,4 +211,126 @@ test("BG_RUN_SHELL override and missing-shell fallback", { timeout: 15_000 }, as
 		{ BG_RUN_SHELL: "/nonexistent-shell-for-test" },
 	);
 	assert.match(r.text, /shell \/bin\/sh\b/);
+});
+
+const startSession = (mode: string, sessionKey = "sess-test") =>
+	`for (const h of handlers.get("session_start") ?? []) await h({ type: "session_start", reason: "startup" }, { mode: ${JSON.stringify(mode)}, sessionManager: { getSessionId: () => ${JSON.stringify(sessionKey)} } });`;
+
+const shutdownSession = (mode: string) =>
+	`for (const h of handlers.get("session_shutdown") ?? []) await h({ type: "session_shutdown", reason: "quit" }, { mode: ${JSON.stringify(mode)} });`;
+
+test("print-mode shutdown keeps the task alive and writes a running ledger", { timeout: 30_000 }, async () => {
+	const r = scenario(
+		`
+		${startSession("print")}
+		const run = await bgRun({ command: "sleep 20", name: "svc", timeoutSeconds: 60 });
+		await new Promise(res => setTimeout(res, 400));
+		${shutdownSession("print")}
+		await new Promise(res => setTimeout(res, 400));
+		const ledger = JSON.parse(await Bun.file(dir + "/" + run.details.id + ".json").text());
+		result = { alive: groupAlive(run.details.pid), status: ledger.status, ownerExitedAt: !!ledger.ownerExitedAt, reapPolicy: ledger.reapPolicy, mode: ledger.mode, text: run.content[0].text };
+		`,
+		{},
+	);
+	assert.equal(r.alive, true);
+	assert.equal(r.status, "running");
+	assert.equal(r.ownerExitedAt, true);
+	assert.equal(r.reapPolicy, "deadline");
+	assert.equal(r.mode, "print");
+	assert.match(r.text, /will not come back to this turn/);
+});
+
+test("tui shutdown still uses on-owner-exit policy and kills", { timeout: 30_000 }, async () => {
+	const r = scenario(
+		`
+		${startSession("tui")}
+		const run = await bgRun({ command: "sleep 20", name: "tui-svc", timeoutSeconds: 60 });
+		await new Promise(res => setTimeout(res, 400));
+		${shutdownSession("tui")}
+		await new Promise(res => setTimeout(res, 600));
+		result = { alive: groupAlive(run.details.pid), text: run.content[0].text };
+		`,
+		{},
+	);
+	assert.equal(r.alive, false);
+	assert.doesNotMatch(r.text, /will not come back to this turn/);
+});
+
+test("next session start reports a task that finished with no session attached", { timeout: 60_000 }, async () => {
+	const dir = join(tmpdir(), `bg-test-xproc-${process.pid}-${Date.now()}`);
+	mkdirSync(dir, { recursive: true });
+	const first = scenario(
+		`
+		${startSession("print", "sess-a")}
+		const run = await bgRun({ command: "sleep 1; echo done-xproc", name: "xproc", timeoutSeconds: 30 });
+		result = { id: run.details.id };
+		`,
+		{},
+		{ BG_RUN_DIR: dir },
+	);
+	await new Promise((res) => setTimeout(res, 2500));
+	const second = scenario(
+		`
+		${startSession("print", "sess-a")}
+		await new Promise(res => setTimeout(res, 300));
+		const list = await tools.get("bg_list").execute("call", {});
+		result = { pushed: sent.filter(m => /while no session was attached/.test(m.content)).length, listed: list.content[0].text };
+		`,
+		{},
+		{ BG_RUN_DIR: dir },
+	);
+	assert.equal(second.pushed, 1);
+	assert.match(second.listed, new RegExp(first.id));
+});
+
+test("session_start reaps on-owner-exit orphans whose owner is gone", { timeout: 30_000 }, async () => {
+	const r = scenario(
+		`
+		const { spawn } = await import("node:child_process");
+		const fs = await import("node:fs");
+		const proc = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+		const id = "aaaabbbb";
+		const ledger = {
+			id, name: "orphan", command: "sleep 60", logPath: dir + "/" + id + ".log",
+			pid: proc.pid, pgid: proc.pid, startedAt: Date.now(), deadlineAt: Date.now() + 60000, timeoutSeconds: 60,
+			mode: "print", sessionKey: "gone", reapPolicy: "on-owner-exit",
+			owner: { pid: 4000001, mode: "print", sessionKey: "gone" },
+			status: "running", exitCode: null, signal: null, finishedAt: null, notified: false,
+		};
+		fs.writeFileSync(dir + "/" + id + ".json", JSON.stringify(ledger));
+		${startSession("print", "sess-new")}
+		await new Promise(res => setTimeout(res, 900));
+		const after = JSON.parse(fs.readFileSync(dir + "/" + id + ".json", "utf8"));
+		result = { alive: groupAlive(proc.pid), status: after.status };
+		`,
+		{},
+	);
+	assert.equal(r.alive, false);
+	assert.equal(r.status, "killed");
+});
+
+test("bg_tail running text is mode-aware", { timeout: 30_000 }, async () => {
+	const tui = scenario(
+		`
+		${startSession("tui")}
+		const run = await bgRun({ command: "sleep 20", timeoutSeconds: 60 });
+		await bgTail(run.details.id);
+		const t = await bgTail(run.details.id);
+		result = { text: t.content[0].text };
+		`,
+		{},
+	);
+	assert.match(tui.text, /End your turn/);
+	const print = scenario(
+		`
+		${startSession("print")}
+		const run = await bgRun({ command: "sleep 20", timeoutSeconds: 60 });
+		await bgTail(run.details.id);
+		const t = await bgTail(run.details.id);
+		result = { text: t.content[0].text };
+		`,
+		{},
+	);
+	assert.doesNotMatch(print.text, /End your turn/);
+	assert.match(print.text, /one-shot/);
 });

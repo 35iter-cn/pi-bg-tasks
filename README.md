@@ -6,24 +6,27 @@ Background task tools for the [pi coding agent](https://github.com/badlogic/pi-m
 
 ## Highlights
 
-- **~400 tokens. Total.** Measured static context injection: three tool schemas + one-line prompt snippets. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools — this is **~12× lighter**.
-- **Three tools, nothing else.** `bg_run` + `bg_tail` + `bg_stop`. No slash commands, no widgets, no config surface, no other tools to trip over.
-- **Zero dependencies, single file.** One ~330-line TypeScript file. pi bundles `typebox` and its own API — there is nothing to install. Copy the file into your extensions folder if you don't even want a package.
+- **~400 tokens for the three core tools.** Measured static injection for `bg_run` + `bg_tail` + `bg_stop`; the two ops tools (`bg_list`, `bg_gc`) add one short paragraph each. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools.
+- **Five tools, three of them core.** `bg_run` + `bg_tail` + `bg_stop` for the normal loop, plus `bg_list` / `bg_gc` for reattaching to and reaping tasks from earlier sessions. No slash commands, no widgets, no config surface.
+- **Zero dependencies, single file.** One TypeScript file. pi bundles `typebox` and its own API — there is nothing to install. Copy the file into your extensions folder if you don't even want a package.
+- **Survives one-shot sessions.** In `--print` / `json` / `rpc` mode the session may exit within seconds; its tasks keep running under a hard `timeout` watchdog and report back on the next session start.
 - **Fire-and-forget.** The description gives the model one decision rule (~10 seconds and up) and states that a completion arrives as a new turn — so there is nothing to wait for inside the current one. Completion messages are delivered as steering messages that trigger a turn.
 
 ## What is this?
 
 pi's built-in `bash` tool blocks the agent until the command exits. For dev servers, builds, watchers, and other long-running work, that wastes the turn — or pushes the model toward polling loops.
 
-`pi-bg-tasks` adds exactly three custom tools:
+`pi-bg-tasks` adds five custom tools:
 
 | Tool | Purpose |
 |---|---|
 | `bg_run` | Start a command in the background, get an id and log path immediately |
 | `bg_tail` | (Fallback) read a task's status and recent output |
-| `bg_stop` | Stop a task started in this session (kills the whole process group) |
+| `bg_stop` | Stop a task — this session's, or an orphan from an earlier one (kills the whole process group) |
+| `bg_list` | List tasks on this machine, including ones started by sessions that are already gone |
+| `bg_gc` | Reap tasks whose owning session is gone or whose deadline passed |
 
-When a task exits, the extension pushes a message into the conversation with the last 4 KB of output and triggers a turn — the agent sees the result without being asked.
+When a task exits and a session can still receive messages, the extension pushes one with the last 4 KB of output and triggers a turn — the agent sees the result without being asked.
 
 ## Install
 
@@ -31,7 +34,7 @@ When a task exits, the extension pushes a message into the conversation with the
 pi install git:github.com/35iter-cn/pi-bg-tasks
 ```
 
-Then restart pi — the `bg_run`, `bg_tail`, and `bg_stop` tools appear automatically.
+Then restart pi — the `bg_run`, `bg_tail`, `bg_stop`, `bg_list`, and `bg_gc` tools appear automatically.
 
 **Try without installing:**
 
@@ -71,7 +74,7 @@ Returns immediately with a task id, pid, and log path.
 |---|---|---|
 | `id` | string, required | Task id (or unambiguous prefix) |
 
-Kills the whole process group (`SIGTERM`, then `SIGKILL` after a 5s grace period) and removes the task record. Only stops tasks started in the current session. |
+Kills the whole process group (`SIGTERM`, then `SIGKILL` after a 5s grace period) and removes the task record. Works on this session's tasks and on orphans recorded on disk (the pid is validated against its `starttime` first, so a recycled pid is never killed by mistake). |
 
 ### `bg_tail`
 
@@ -82,12 +85,30 @@ Kills the whole process group (`SIGTERM`, then `SIGKILL` after a 5s grace period
 
 Mid-run reads are throttled to once per 30 s to discourage polling.
 
+### `bg_list`
+
+| Parameter | Type | Description |
+|---|---|---|
+| `orphans` | boolean, optional | Only list tasks whose owning session is gone |
+
+Newest first, with status, reap policy, age, whether the owner is still alive, and the log path.
+
+### `bg_gc`
+
+| Parameter | Type | Description |
+|---|---|---|
+| `dryRun` | boolean, optional | Report what would be reaped without killing anything |
+
+Kills tasks marked `on-owner-exit` whose owner is gone, kills tasks past their deadline, and marks vanished processes as `lost`.
+
 ## How it works
 
 - Output goes to `~/.pi/agent/bg-tasks/<timestamp>-<id>.log`; logs older than 7 days are cleaned up on session start.
 - Processes run detached in their own process group, and are killed as a group (`SIGTERM`, then `SIGKILL` after a 5 s grace period) on timeout or `bg_stop`. Timeout kills say so explicitly in the completion message — if the task was a long-running service, the model is told to restart it with a larger `timeoutSeconds`.
-- **Tasks belong to the session that started them**: on `session_shutdown` (quit, `/new`, resume, fork, reload) every task started by that session is killed as a group. Tasks of other concurrently running pi instances are unaffected.
-- On exit, a completion message (with a 4 KB output tail) is delivered as a steering message with `triggerTurn`, so the agent picks it up on the spot.
+- **Reaping follows the runtime mode.** In an interactive session (`tui`), `session_shutdown` kills every task it started: closing pi takes its children down, as before. In a one-shot run (`--print`, `json`, `rpc`) shutdown leaves the tasks running, records the owner exit in the ledger, and they are reported on the next session start.
+- **Every task carries a hard deadline.** The command runs under `timeout -k 5 <timeoutSeconds>`, so it dies at its deadline even if the pi process that started it is long gone. On timeout the whole process group is killed, which also catches grandchildren the wrapper did not parent.
+- **State lives on disk**, not in the process: `~/.pi/agent/bg-tasks/<id>.json` (ledger: pid, pgid, `starttime`, deadline, owner, reap policy, status) and `<id>.exit` (exit code + finish time). That is what makes an exit observable across processes.
+- On exit, when a session can still receive messages, a completion message (with a 4 KB output tail) is delivered as a steering message with `triggerTurn`, and the ledger is marked notified.
 - Session-replacement safe: if you run `/new`, fork, switch sessions, or `/reload`, a stale completion notification is dropped instead of crashing pi. (Session replacement kills this session's tasks first by design, so what you receive afterwards is the kill notification.) The log stays on disk — `bg_tail` can still fetch it.
 
 ## FAQ
@@ -102,10 +123,13 @@ No — commands run through `/bin/sh`. POSIX systems only.
 It runs arbitrary shell commands with your user's permissions, exactly like pi's built-in bash tool. The usual pi extension security note applies: review the source before installing.
 
 **Does the tool list bloat my context?**
-Measured: ~400 tokens of static injection per request — three compact tool definitions. See [Highlights](#highlights).
+The three core tools measured ~400 tokens of static injection; the two ops tools are a short paragraph each. See [Highlights](#highlights).
 
 **Do tasks survive pi exiting?**
-No. Tasks belong to their session: a normally-closing session (including quitting pi) takes its tasks down with it. Only if pi is killed with SIGKILL / loses power — no cleanup path runs — can a process group linger; clean it up manually in the next session.
+It depends on the mode. Interactive (`tui`): no, they die with the session, exactly as before. One-shot (`--print`, `json`, `rpc`, which is how chat bridges run pi): yes — they keep running under their `timeout` deadline, and the next session start reports whichever of them finished in the meantime. `bg_list` shows what is still alive, `bg_gc` reaps what nobody owns any more.
+
+**Is there a chance a task outlives everything?**
+No. The deadline is enforced by `timeout` inside the task's own process group, so it does not depend on pi being alive. `bg_gc` and the session-start sweep only clean up earlier.
 
 ## License
 
