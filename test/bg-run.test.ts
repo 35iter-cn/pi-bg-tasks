@@ -283,6 +283,42 @@ test("next session start reports a task that finished with no session attached",
 	assert.match(second.listed, new RegExp(first.id));
 });
 
+test("completion is only reported to the session that owns the task", { timeout: 60_000 }, async () => {
+	const dir = join(tmpdir(), `bg-test-sess-${process.pid}-${Date.now()}`);
+	mkdirSync(dir, { recursive: true });
+	const first = scenario(
+		`
+		${startSession("print", "sess-owner")}
+		const run = await bgRun({ command: "sleep 1; echo done-sess", name: "sess", timeoutSeconds: 30 });
+		result = { id: run.details.id };
+		`,
+		{},
+		{ BG_RUN_DIR: dir },
+	);
+	await new Promise((res) => setTimeout(res, 2500));
+	const other = scenario(
+		`
+		${startSession("print", "sess-other")}
+		await new Promise(res => setTimeout(res, 300));
+		result = { pushed: sent.filter(m => /while no session was attached/.test(m.content)).length };
+		`,
+		{},
+		{ BG_RUN_DIR: dir },
+	);
+	assert.equal(other.pushed, 0);
+	const owner = scenario(
+		`
+		${startSession("print", "sess-owner")}
+		await new Promise(res => setTimeout(res, 300));
+		result = { pushed: sent.filter(m => /while no session was attached/.test(m.content)).length };
+		`,
+		{},
+		{ BG_RUN_DIR: dir },
+	);
+	assert.equal(owner.pushed, 1);
+	assert.ok(first.id);
+});
+
 test("session_start reaps on-owner-exit orphans whose owner is gone", { timeout: 30_000 }, async () => {
 	const r = scenario(
 		`
