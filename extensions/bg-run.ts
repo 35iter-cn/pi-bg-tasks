@@ -482,7 +482,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool<typeof BgRunParams, { id: string }>({
 		name: "bg_run",
 		label: "Background Run",
-		promptSnippet: "Run anything slower than ~10 seconds in the background; returns immediately, result arrives as a new turn",
+		promptSnippet:
+			"Run anything slower than ~10 seconds in the background; returns immediately, result arrives as a new turn. The bash tool has no background switch: a server or long job there blocks the turn until it exits.",
 		description:
 			"Run a shell command in the background and return at once with an id and log path. Decide by runtime, not by command type: anything likely to exceed ~10 seconds belongs here, unknown durations included; foreground bash is only for commands you know finish instantly. An extra turn is cheap, a blocked turn is not. Completion is pushed as a new message when the session can receive one, so nothing is gained by waiting inside your turn: do independent work, or end the turn. Every task carries a hard deadline and is killed when it is reached.",
 		parameters: BgRunParams,
