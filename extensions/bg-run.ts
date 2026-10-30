@@ -382,7 +382,7 @@ function cleanupOldLogs(): void {
 function modeHint(): string {
 	return currentMode === "tui"
 		? ""
-		: " This session is one-shot: the result will not come back to this turn. Use bg_tail to read it now, or let it finish and the next session start will report it.";
+		: " This session is one-shot: a finished job's outcome never returns to this turn — read it with bg_tail, or let the next session start report it. A service's readiness is different: probe it now with one bounded command and keep going. Never run a long-lived command in foreground bash to make it observable.";
 }
 
 function formatLedgerLine(ledger: Ledger): string {
@@ -483,9 +483,9 @@ export default function (pi: ExtensionAPI) {
 		name: "bg_run",
 		label: "Background Run",
 		promptSnippet:
-			"Run anything slower than ~10 seconds in the background; returns immediately, result arrives as a new turn. The bash tool has no background switch: a server or long job there blocks the turn until it exits.",
+			"Run anything slower than ~10 seconds in the background; returns immediately, result arrives as a new turn. Servers, watchers and dev processes start here too: the bash tool has no background switch, so one there blocks the turn until it exits.",
 		description:
-			"Run a shell command in the background and return at once with an id and log path. Decide by runtime, not by command type: anything likely to exceed ~10 seconds belongs here, unknown durations included; foreground bash is only for commands you know finish instantly. An extra turn is cheap, a blocked turn is not. Completion is pushed as a new message when the session can receive one, so nothing is gained by waiting inside your turn: do independent work, or end the turn. Every task carries a hard deadline and is killed when it is reached.",
+			"Run a shell command in the background and return at once with an id and log path. Decide by runtime, not by command type: anything likely to exceed ~10 seconds belongs here, unknown durations included; foreground bash is only for commands that finish on their own. A server never exits, so its exit is not the event you need: start it here, then confirm readiness with one bounded probe (`ss -tlnp`, `curl -m 2`, or `bg_tail <id>`). Never put a server in one call of a batch and its probe in another: a batch runs in order, so the probe never starts. An extra turn is cheap, a blocked turn is not. Completion is pushed as a new message: for a finite job, do independent work or end the turn. Every task carries a hard deadline and is killed when it is reached.",
 		parameters: BgRunParams,
 		async execute(_toolCallId, params: Static<typeof BgRunParams>) {
 			const dir = resolveLogDir();
@@ -567,7 +567,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Started background task ${name} (${id}), pid ${child.pid}, shell ${shell}, deadline ${timeoutSeconds}s. Log: ${logPath}.${currentMode === "tui" ? " Its result arrives as a new turn when the process exits; nothing done inside this turn makes it sooner." : ""}${modeHint()}`,
+						text: `Started background task ${name} (${id}), pid ${child.pid}, shell ${shell}, deadline ${timeoutSeconds}s. Log: ${logPath}.${currentMode === "tui" ? " Its result arrives as a new turn when the process exits. For a service, do not wait for that: confirm readiness with one bounded probe, then carry on." : ""}${modeHint()}`,
 					},
 				],
 				details: { id, pid: child.pid, shell },
