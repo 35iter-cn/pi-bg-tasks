@@ -89,31 +89,45 @@ test("every tool snippet names its bg_run association", () => {
 	assert.match(r.tailGuidelines, /bg_run/);
 });
 
-test("tui start receipt points a service at its log", () => {
-	const r = scenario(
-		`
+test("start receipt is identical in tui and print", () => {
+	const receipt = (mode: string) =>
+		scenario(
+			`
+		${startSession(mode)}
 		const run = await bgRun({ command: "sleep 30", timeoutSeconds: 60 });
 		result = { text: run.content[0].text };
 		await bgStop(run.details.id);
 		`,
-		{},
-	);
-	assert.match(r.text, /read its log with bg_tail/);
-	assert.doesNotMatch(r.text, /nothing done inside this turn/);
+			{},
+		);
+	const tui = receipt("tui");
+	const print = receipt("print");
+	const normalize = (text: string) =>
+		text.replace(/pid \d+/g, "pid N").replace(/log \/\S+/g, "log PATH").replace(/\([0-9a-f]{8}\)/g, "(ID)");
+	assert.equal(normalize(tui.text), normalize(print.text));
+	assert.match(tui.text, /A finished job reports itself as its own message/);
+	assert.doesNotMatch(tui.text, /bg_tail it now|one-shot|will not come back/);
 });
 
-test("bg_tail throttle tells a waiting service to read the log", () => {
+test("bg_tail returns the tail first, then only what was appended", () => {
 	const r = scenario(
 		`
-		const run = await bgRun({ command: "sleep 30", timeoutSeconds: 60 });
-		await bgTail(run.details.id);
-		const t = await bgTail(run.details.id);
-		result = { text: t.content[0].text };
+		const run = await bgRun({ command: "echo FIRST; sleep 2; echo SECOND; sleep 30", timeoutSeconds: 60 });
+		await new Promise(r => setTimeout(r, 400));
+		const first = await bgTail(run.details.id);
+		const quiet = await bgTail(run.details.id);
+		await new Promise(r => setTimeout(r, 2200));
+		const later = await bgTail(run.details.id);
+		result = { first: first.content[0].text, quiet: quiet.content[0].text, later: later.content[0].text };
 		await bgStop(run.details.id);
 		`,
 		{},
 	);
-	assert.match(r.text, /readiness line/);
+	assert.match(r.first, /FIRST/);
+	assert.match(r.quiet, /No new output since the last read/);
+	assert.match(r.later, /SECOND/);
+	assert.match(r.later, /\+7 bytes since the last read/);
+	assert.doesNotMatch(r.later, /\nFIRST/);
 });
 
 test("timed-out completion message includes root-cause hint", { timeout: 30_000 }, async () => {
@@ -128,9 +142,10 @@ test("timed-out completion message includes root-cause hint", { timeout: 30_000 
 		{},
 	);
 	assert.match(r.tail, /timed out after 1s \(killed\)/);
-	assert.match(r.tail, /restart it with a larger timeoutSeconds/);
+	assert.match(r.tail, /restart it with bg_run and a larger timeoutSeconds/);
 	assert.ok(r.pushedText, "completion message was pushed");
-	assert.match(r.pushedText, /restart it with a larger timeoutSeconds/);
+	assert.match(r.pushedText, /restart it with bg_run and a larger timeoutSeconds/);
+	assert.match(r.pushedText, /Log: \//);
 });
 
 test("timeout kill terminates the whole process group", { timeout: 30_000 }, async () => {
@@ -159,7 +174,27 @@ test("bg_stop kills the process group immediately", { timeout: 30_000 }, async (
 		`,
 		{},
 	);
-	assert.match(r.stopText, /Stopped background task stop-me/);
+	assert.match(r.stopText, /Signalled task stop-me/);
+	assert.match(r.stopText, /bg_list/);
+	assert.equal(r.afterGrace, false);
+});
+
+test("bg_stop escalates to SIGKILL when SIGTERM is ignored", { timeout: 30_000 }, async () => {
+	const r = scenario(
+		`
+		const run = await bgRun({ command: "trap '' TERM; sleep 60", timeoutSeconds: 90 });
+		await new Promise(r => setTimeout(r, 400));
+		const stop = await bgStop(run.details.id);
+		const quick = groupAlive(run.details.pid);
+		await new Promise(r => setTimeout(r, 2500));
+		const afterGrace = groupAlive(run.details.pid);
+		result = { stopText: stop.content[0].text, quick, afterGrace };
+		`,
+		{},
+	);
+	assert.match(r.stopText, /SIGTERM/);
+	assert.match(r.stopText, /1s/);
+	assert.equal(r.quick, true);
 	assert.equal(r.afterGrace, false);
 });
 
@@ -288,8 +323,8 @@ test("print-mode shutdown keeps the task alive and writes a running ledger", { t
 	assert.equal(r.ownerExitedAt, true);
 	assert.equal(r.reapPolicy, "deadline");
 	assert.equal(r.mode, "print");
-	assert.match(r.text, /never returns to this turn/);
-	assert.match(r.text, /readiness/);
+	assert.doesNotMatch(r.text, /never returns to this turn/);
+	assert.match(r.text, /A finished job reports itself as its own message/);
 });
 
 test("tui shutdown still uses on-owner-exit policy and kills", { timeout: 30_000 }, async () => {
@@ -397,19 +432,8 @@ test("session_start reaps on-owner-exit orphans whose owner is gone", { timeout:
 	assert.equal(r.status, "killed");
 });
 
-test("bg_tail running text is mode-aware", { timeout: 30_000 }, async () => {
-	const tui = scenario(
-		`
-		${startSession("tui")}
-		const run = await bgRun({ command: "sleep 20", timeoutSeconds: 60 });
-		await bgTail(run.details.id);
-		const t = await bgTail(run.details.id);
-		result = { text: t.content[0].text };
-		`,
-		{},
-	);
-	assert.match(tui.text, /End your turn/);
-	const print = scenario(
+test("bg_tail reports no new output instead of throttling", { timeout: 30_000 }, async () => {
+	const r = scenario(
 		`
 		${startSession("print")}
 		const run = await bgRun({ command: "sleep 20", timeoutSeconds: 60 });
@@ -419,6 +443,6 @@ test("bg_tail running text is mode-aware", { timeout: 30_000 }, async () => {
 		`,
 		{},
 	);
-	assert.doesNotMatch(print.text, /End your turn/);
-	assert.match(print.text, /one-shot/);
+	assert.match(r.text, /No new output since the last read/);
+	assert.doesNotMatch(r.text, /throttl|one-shot|End your turn/);
 });
