@@ -65,6 +65,47 @@ test("service timeout hint present in bg_run description and schema", () => {
 	assert.match(r.schema, /outlive the session/);
 });
 
+test("bg_run description names services, readiness and the batch trap", () => {
+	const r = scenario(
+		`result = { desc: tools.get("bg_run").description, snippet: tools.get("bg_run").promptSnippet }`,
+		{},
+	);
+	assert.match(r.desc, /server/i);
+	assert.match(r.desc, /readiness/i);
+	assert.match(r.desc, /probe/i);
+	assert.match(r.desc, /batch/i);
+	assert.match(r.snippet, /Servers, watchers/);
+	assert.doesNotMatch(r.desc, /nothing is gained by waiting inside your turn/);
+});
+
+test("tui start receipt points a service at a readiness probe", () => {
+	const r = scenario(
+		`
+		const run = await bgRun({ command: "sleep 30", timeoutSeconds: 60 });
+		result = { text: run.content[0].text };
+		await bgStop(run.details.id);
+		`,
+		{},
+	);
+	assert.match(r.text, /readiness/);
+	assert.match(r.text, /one bounded probe/);
+	assert.doesNotMatch(r.text, /nothing done inside this turn/);
+});
+
+test("bg_tail throttle tells a waiting service to probe, not to sleep", () => {
+	const r = scenario(
+		`
+		const run = await bgRun({ command: "sleep 30", timeoutSeconds: 60 });
+		await bgTail(run.details.id);
+		const t = await bgTail(run.details.id);
+		result = { text: t.content[0].text };
+		await bgStop(run.details.id);
+		`,
+		{},
+	);
+	assert.match(r.text, /Probe the port or URL/);
+});
+
 test("timed-out completion message includes root-cause hint", { timeout: 30_000 }, async () => {
 	const r = scenario(
 		`
@@ -237,7 +278,8 @@ test("print-mode shutdown keeps the task alive and writes a running ledger", { t
 	assert.equal(r.ownerExitedAt, true);
 	assert.equal(r.reapPolicy, "deadline");
 	assert.equal(r.mode, "print");
-	assert.match(r.text, /will not come back to this turn/);
+	assert.match(r.text, /never returns to this turn/);
+	assert.match(r.text, /readiness/);
 });
 
 test("tui shutdown still uses on-owner-exit policy and kills", { timeout: 30_000 }, async () => {
