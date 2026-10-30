@@ -10,7 +10,7 @@ Background task tools for the [pi coding agent](https://github.com/badlogic/pi-m
 - **Five tools, three of them core.** `bg_run` + `bg_tail` + `bg_stop` for the normal loop, plus `bg_list` / `bg_gc` for reattaching to and reaping tasks from earlier sessions. No slash commands, no widgets, no config surface.
 - **Zero dependencies, single file.** One TypeScript file. pi bundles `typebox` and its own API — there is nothing to install. Copy the file into your extensions folder if you don't even want a package.
 - **Survives one-shot sessions.** In `--print` / `json` / `rpc` mode the session may exit within seconds; its tasks keep running under a hard `timeout` watchdog and report back on the next session start.
-- **Fire-and-forget, with one exception.** The description gives the model one decision rule (~10 seconds and up) and states that a completion arrives as a new turn, so a finite job has nothing to wait for inside the current one. A server never exits, so the same description tells the model to start it here and confirm readiness with one bounded probe (`ss -tlnp`, `curl -m 2`), and never to put a server in one call of a batch and its probe in another — a batch runs in order, so the probe never starts. Completion messages are delivered as steering messages that trigger a turn.
+- **Fire-and-forget, with one exception.** The description gives the model one decision rule (~10 seconds and up) and states that a completion arrives as its own message — the start receipt is the same in interactive and one-shot sessions. A server never exits, so readiness comes from its log: `bg_tail` it, and add one bounded port probe only when the log carries no readiness line. Never put a server in one call of a batch and its check in another — a batch runs in order, so the check never starts. Completion messages are delivered as steering messages that trigger a turn.
 
 ## What is this?
 
@@ -83,7 +83,7 @@ Kills the whole process group (`SIGTERM`, then `SIGKILL` after a 5s grace period
 | `id` | string, required | Task id (or unambiguous prefix) |
 | `bytes` | number, optional | Max bytes of log tail to return. Default 4096, max 65536 |
 
-Mid-run reads are throttled to once per 30 s to discourage polling.
+A repeat read returns only what the task appended since the last read, or says there is no new output.
 
 ### `bg_list`
 
@@ -104,7 +104,7 @@ Kills tasks marked `on-owner-exit` whose owner is gone, kills tasks past their d
 ## How it works
 
 - Output goes to `~/.pi/agent/bg-tasks/<timestamp>-<id>.log`; logs older than 7 days are cleaned up on session start.
-- Processes run detached in their own process group, and are killed as a group (`SIGTERM`, then `SIGKILL` after a 5 s grace period) on timeout or `bg_stop`. Timeout kills say so explicitly in the completion message — if the task was a long-running service, the model is told to restart it with a larger `timeoutSeconds`.
+- Processes run detached in their own process group, and are killed as a group (`SIGTERM`, then `SIGKILL` after a 1 s grace period) on timeout or `bg_stop`. Timeout kills say so explicitly in the completion message — if the task was a long-running service, the model is told to restart it with `bg_run` and a larger `timeoutSeconds`.
 - **Reaping follows the runtime mode.** In an interactive session (`tui`), `session_shutdown` kills every task it started: closing pi takes its children down, as before. In a one-shot run (`--print`, `json`, `rpc`) shutdown leaves the tasks running, records the owner exit in the ledger, and they are reported on the next session start.
 - **Every task carries a hard deadline.** The command runs under `timeout -k 5 <timeoutSeconds>`, so it dies at its deadline even if the pi process that started it is long gone. On timeout the whole process group is killed, which also catches grandchildren the wrapper did not parent.
 - **State lives on disk**, not in the process: `~/.pi/agent/bg-tasks/<id>.json` (ledger: pid, pgid, `starttime`, deadline, owner, reap policy, status) and `<id>.exit` (exit code + finish time). That is what makes an exit observable across processes.

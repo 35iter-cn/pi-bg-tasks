@@ -21,8 +21,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const LOG_DIR = process.env.BG_RUN_DIR || join(homedir(), ".pi", "agent", "bg-tasks");
 const DEFAULT_TIMEOUT_SECONDS = 1800;
 const MAX_TIMEOUT_SECONDS = 86400;
-const THROTTLE_MS = 30_000;
 const NOTIFY_TAIL_BYTES = 4096;
+const KILL_GRACE_MS = 1_000;
 const LEDGER_RETENTION_MS = 7 * 24 * 3600 * 1000;
 
 const SERVICE_TIMEOUT_HINT = "A service meant to outlive the session needs 86400 — the default is a runaway guard, not a lifespan.";
@@ -49,7 +49,7 @@ type Task = {
 	exitCode: number | null;
 	signal: string | null;
 	timedOut: boolean;
-	lastTailAt: number;
+	lastReadOffset: number;
 	notified: boolean;
 };
 
@@ -77,7 +77,7 @@ type Ledger = {
 };
 
 const tasks = new Map<string, Task>();
-const tailedAt = new Map<string, number>();
+const readOffsets = new Map<string, number>();
 
 let currentMode = "tui";
 let currentSessionKey = "";
@@ -199,7 +199,40 @@ function readTail(logPath: string, bytes: number): string {
 	}
 }
 
-const TIMEOUT_HINT = " auto-killed because timeoutSeconds was reached — if this was meant to be a long-running service, restart it with a larger timeoutSeconds.";
+function fileSize(logPath: string): number {
+	try {
+		return statSync(logPath).size;
+	} catch {
+		return 0;
+	}
+}
+
+function readNew(logPath: string, since: number, maxBytes: number): { text: string; next: number; added: number } {
+	const size = fileSize(logPath);
+	if (size <= since) return { text: "", next: size, added: 0 };
+	const start = Math.max(since, size - maxBytes);
+	const length = size - start;
+	const fd = openSync(logPath, "r");
+	try {
+		const buf = Buffer.alloc(length);
+		readSync(fd, buf, 0, length, start);
+		return { text: buf.toString("utf8"), next: size, added: size - start };
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function groupAlive(pgid: number | undefined): boolean {
+	if (pgid === undefined) return false;
+	try {
+		process.kill(-pgid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+const TIMEOUT_HINT = " auto-killed because timeoutSeconds was reached — if this was meant to be a long-running service, restart it with bg_run and a larger timeoutSeconds.";
 
 function statusLine(status: TaskStatus, exitCode: number | null, signal: string | null, timeoutSeconds: number): string {
 	if (status === "timedout") return `timed out after ${timeoutSeconds}s (killed).${TIMEOUT_HINT}`;
@@ -290,27 +323,28 @@ function killTask(task: Task): void {
 	} catch {}
 	const grace = setTimeout(() => {
 		if (task.exited) return;
+		if (!groupAlive(pid)) return;
 		try {
 			process.kill(-pid, "SIGKILL");
 		} catch {}
-	}, 5_000);
-	grace.unref();
+	}, KILL_GRACE_MS);
+	void grace;
 }
 
 function killLedger(ledger: Ledger): boolean {
 	const pid = ledger.pgid ?? ledger.pid;
 	if (pid === undefined) return false;
-	if (!pidAlive(pid, ledger.startTicks)) return false;
+	if (!groupAlive(pid)) return false;
 	try {
 		process.kill(-pid, "SIGTERM");
 	} catch {}
-	const target = pid;
 	const grace = setTimeout(() => {
+		if (!groupAlive(pid)) return;
 		try {
-			process.kill(-target, "SIGKILL");
+			process.kill(-pid, "SIGKILL");
 		} catch {}
-	}, 5_000);
-	grace.unref();
+	}, KILL_GRACE_MS);
+	void grace;
 	return true;
 }
 
@@ -379,12 +413,6 @@ function cleanupOldLogs(): void {
 	}
 }
 
-function modeHint(): string {
-	return currentMode === "tui"
-		? ""
-		: " This session is one-shot: a finished job's outcome never returns to this turn — read it with bg_tail, or let the next session start report it. A service's readiness is different: probe it now with one bounded command and keep going. Never run a long-lived command in foreground bash to make it observable.";
-}
-
 function formatLedgerLine(ledger: Ledger): string {
 	const age = Math.round((Date.now() - ledger.startedAt) / 1000);
 	const alive = pidAlive(ledger.pgid ?? ledger.pid, ledger.startTicks);
@@ -420,7 +448,7 @@ export default function (pi: ExtensionAPI) {
 						pi.sendMessage(
 							{
 								customType: "minimal-bg",
-								content: `Background task ${ledger.name} (${ledger.id}) ${suffix} while no session was attached\n${tail}`,
+								content: `Background task ${ledger.name} (${ledger.id}) ${suffix} while no session was attached\nLog: ${ledger.logPath}\n${tail}`,
 								display: true,
 								details: { id: ledger.id, name: ledger.name, exitCode: ledger.exitCode, signal: ledger.signal, timedOut: ledger.status === "timedout", logPath: ledger.logPath },
 							},
@@ -531,7 +559,7 @@ export default function (pi: ExtensionAPI) {
 				exitCode: null,
 				signal: null,
 				timedOut: false,
-				lastTailAt: 0,
+				lastReadOffset: -1,
 				notified: false,
 			};
 			tasks.set(id, task);
@@ -558,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 					pi.sendMessage(
 						{
 							customType: "minimal-bg",
-							content: `Background task ${name} (${id}) ${suffix}\n${tail}`,
+							content: `Background task ${name} (${id}) ${suffix}\nLog: ${logPath}\n${tail}`,
 							display: true,
 							details: { id, name, exitCode: code, signal, timedOut: task.timedOut, logPath },
 						},
@@ -573,7 +601,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Started background task ${name} (${id}), pid ${child.pid}, shell ${shell}, deadline ${timeoutSeconds}s. Log: ${logPath}.${currentMode === "tui" ? " Its result arrives as a new turn when the process exits. For a service, do not wait for that: read its log with bg_tail, then carry on." : ""}${modeHint()}`,
+						text: `Started ${name} (${id}), pid ${child.pid}, shell ${shell}, deadline ${timeoutSeconds}s, log ${logPath}. A finished job reports itself as its own message.`,
 					},
 				],
 				details: { id, pid: child.pid, shell },
@@ -590,14 +618,14 @@ export default function (pi: ExtensionAPI) {
 			"Read a bg_run task's log once to judge progress or readiness, then carry on: for a finite job the completion bg_run pushes is the only exit event.",
 		],
 		description:
-			"Read a task started with bg_run by id: its status, the time left before its deadline, and the end of its log (default last 4 KB, up to 64 KB). A finished task's result is pushed by bg_run; reads of a running task are throttled to one per 30 seconds.",
+			"Read a task started with bg_run by id: its status, the time left before its deadline, and the end of its log (default last 4 KB, up to 64 KB). A finished task's result is pushed by bg_run; a repeat read returns only what was appended since the last read, or says there is none.",
 		parameters: BgTailParams,
 		async execute(_toolCallId, params: Static<typeof BgTailParams>) {
 			const bytes = Math.min(Math.max(params.bytes ?? 4096, 1), 65536);
 			const resolved = resolveTask(params.id);
 			if (resolved.candidates) {
 				return {
-					content: [{ type: "text", text: `Ambiguous id prefix; candidates: ${resolved.candidates.join(", ")}` }],
+					content: [{ type: "text", text: `Ambiguous id prefix; candidates: ${resolved.candidates.join(", ")} — pass a longer prefix.` }],
 					details: { id: params.id },
 				};
 			}
@@ -609,27 +637,25 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (task) {
 				if (!task.exited) {
-					if (Date.now() - task.lastTailAt < THROTTLE_MS) {
+					const stamp = `${new Date(task.startedAt).toISOString()}, deadline in ${Math.max(0, Math.round((task.deadlineAt - Date.now()) / 1000))}s`;
+					if (task.lastReadOffset < 0) {
+						task.lastReadOffset = fileSize(logPath);
 						return {
-							content: [
-								{
-									type: "text",
-									text:
-										currentMode === "tui"
-											? `Task ${id} still running. Waiting for it to finish? End your turn — completion arrives as a new turn and re-reading cannot make it sooner. Waiting for a service to be ready? Check the log for its readiness line; probe the port only if the log carries none.`
-											: `Task ${id} still running. This session is one-shot, so ending the turn ends the job: read it again later, bg_stop it, or leave it running and the next session start will report its outcome.`,
-								},
-							],
+							content: [{ type: "text", text: `Task ${id} (${task.name}) running since ${stamp}\n${readTail(logPath, bytes)}` }],
 							details: { id },
 						};
 					}
-					task.lastTailAt = Date.now();
+					const chunk = readNew(logPath, task.lastReadOffset, bytes);
+					task.lastReadOffset = chunk.next;
+					if (chunk.added === 0) {
+						return {
+							content: [{ type: "text", text: `Task ${id} (${task.name}) running since ${stamp}. No new output since the last read.` }],
+							details: { id },
+						};
+					}
 					return {
 						content: [
-							{
-								type: "text",
-								text: `Task ${id} (${task.name}) running since ${new Date(task.startedAt).toISOString()}, deadline in ${Math.max(0, Math.round((task.deadlineAt - Date.now()) / 1000))}s\n${readTail(logPath, bytes)}`,
-							},
+							{ type: "text", text: `Task ${id} (${task.name}) running since ${stamp} (+${chunk.added} bytes since the last read)\n${chunk.text}` },
 						],
 						details: { id },
 					};
@@ -649,28 +675,26 @@ export default function (pi: ExtensionAPI) {
 			const exit = readExit(id);
 			const alive = pidAlive(ledger.pgid ?? ledger.pid, ledger.startTicks);
 			if (ledger.status === "running" && alive) {
-				const last = tailedAt.get(id) ?? 0;
-				if (Date.now() - last < THROTTLE_MS) {
+				const stamp = `${new Date(ledger.startedAt).toISOString()}, deadline in ${Math.max(0, Math.round((ledger.deadlineAt - Date.now()) / 1000))}s, owner ${pidAlive(ledger.owner?.pid, ledger.owner?.startTicks) ? "alive" : "gone"}`;
+				const known = readOffsets.get(id);
+				if (known === undefined) {
+					readOffsets.set(id, fileSize(logPath));
 					return {
-						content: [
-							{
-								type: "text",
-								text:
-									currentMode === "tui"
-										? `Task ${id} still running (started by another session). Waiting for it to finish? End your turn — its completion is reported when it exits. Waiting for it to be ready? Check the log for its readiness line; probe the port only if the log carries none.`
-										: `Task ${id} still running (started by another session). This session is one-shot: read it again later, or leave it and the next session start will report its outcome.`,
-							},
-						],
+						content: [{ type: "text", text: `Task ${id} (${ledger.name}) running since ${stamp}\n${readTail(logPath, bytes)}` }],
 						details: { id },
 					};
 				}
-				tailedAt.set(id, Date.now());
+				const chunk = readNew(logPath, known, bytes);
+				readOffsets.set(id, chunk.next);
+				if (chunk.added === 0) {
+					return {
+						content: [{ type: "text", text: `Task ${id} (${ledger.name}) running since ${stamp}. No new output since the last read.` }],
+						details: { id },
+					};
+				}
 				return {
 					content: [
-						{
-							type: "text",
-							text: `Task ${id} (${ledger.name}) running since ${new Date(ledger.startedAt).toISOString()}, deadline in ${Math.max(0, Math.round((ledger.deadlineAt - Date.now()) / 1000))}s, owner ${pidAlive(ledger.owner?.pid, ledger.owner?.startTicks) ? "alive" : "gone"}\n${readTail(logPath, bytes)}`,
-						},
+						{ type: "text", text: `Task ${id} (${ledger.name}) running since ${stamp} (+${chunk.added} bytes since the last read)\n${chunk.text}` },
 					],
 					details: { id },
 				};
@@ -698,12 +722,12 @@ export default function (pi: ExtensionAPI) {
 			"Stop a service with bg_stop when you are done: an unstopped 24h task lingers as an orphan holding its port.",
 		],
 		description:
-			"Stop a task started with bg_run, given its id or an unambiguous prefix. The whole process group is signalled (SIGTERM, then SIGKILL after 5 seconds) and the task record is closed; a task from an earlier session is resolved from disk with its pid validated against the recorded start time.",
+			"Stop a task started with bg_run, given its id or an unambiguous prefix. The whole process group is signalled (SIGTERM, then SIGKILL after 1 second) and the task record is closed; a task from an earlier session is resolved from disk.",
 		parameters: BgStopParams,
 		async execute(_toolCallId, params: Static<typeof BgStopParams>) {
 			const resolved = resolveTask(params.id);
 			if (resolved.candidates) {
-				return { content: [{ type: "text", text: `Ambiguous id prefix; candidates: ${resolved.candidates.join(", ")}` }], details: { id: params.id } };
+				return { content: [{ type: "text", text: `Ambiguous id prefix; candidates: ${resolved.candidates.join(", ")} — pass a longer prefix.` }], details: { id: params.id } };
 			}
 			const task = resolved.task;
 			if (task) {
@@ -721,7 +745,7 @@ export default function (pi: ExtensionAPI) {
 				ledger.notified = true;
 				writeLedger(ledger);
 				return {
-					content: [{ type: "text", text: `Stopped background task ${task.name} (${task.id}), pid ${task.pid}. Log: ${task.logPath}` }],
+					content: [{ type: "text", text: `Signalled task ${task.name} (${task.id}), group ${task.pgid ?? task.pid}: SIGTERM now, SIGKILL in ${KILL_GRACE_MS / 1000}s if it survives. Confirm it is gone with bg_list.` }],
 					details: { id: task.id, stopped: true },
 				};
 			}
@@ -733,7 +757,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text: id
-								? `Task ${id} is not running in this session (it already exited, or it was started in a previous session). Check its log: ${findLogFile(id) ?? "log cleaned up or not found"}.`
+								? `Task ${id} is not running in this session (it already exited, or it was started in a previous session). Its log is still readable with bg_tail: ${findLogFile(id) ?? "log cleaned up or not found"}.`
 								: `No task found for id ${params.id}`,
 						},
 					],
@@ -748,7 +772,7 @@ export default function (pi: ExtensionAPI) {
 				ledger.notified = true;
 				writeLedger(ledger);
 				return {
-					content: [{ type: "text", text: `Stopped background task ${ledger.name} (${ledger.id}), pgid ${ledger.pgid ?? ledger.pid}. Log: ${ledger.logPath}` }],
+					content: [{ type: "text", text: `Signalled task ${ledger.name} (${ledger.id}), group ${ledger.pgid ?? ledger.pid}: SIGTERM now, SIGKILL in ${KILL_GRACE_MS / 1000}s if it survives. Confirm it is gone with bg_list.` }],
 					details: { id: ledger.id, stopped: true },
 				};
 			}
