@@ -605,7 +605,7 @@ export default function (pi: ExtensionAPI) {
 									type: "text",
 									text:
 										currentMode === "tui"
-											? `Task ${id} still running. Completion is a process-exit event, not a timed one, so checking again — or sleeping — makes the result arrive exactly as late. End your turn; the result comes back as a new turn.`
+											? `Task ${id} still running. Waiting for it to finish? End your turn — completion arrives as a new turn and re-reading cannot make it sooner. Waiting for a service to be ready? Probe the port or URL, with one bounded command.`
 											: `Task ${id} still running. This session is one-shot, so ending the turn ends the job: read it again later, bg_stop it, or leave it running and the next session start will report its outcome.`,
 								},
 							],
@@ -646,7 +646,7 @@ export default function (pi: ExtensionAPI) {
 								type: "text",
 								text:
 									currentMode === "tui"
-										? `Task ${id} still running (started by another session). End your turn; its completion will be reported when it exits.`
+										? `Task ${id} still running (started by another session). Waiting for it to finish? End your turn — its completion is reported when it exits. Waiting for it to be ready? Probe the port or URL, with one bounded command.`
 										: `Task ${id} still running (started by another session). This session is one-shot: read it again later, or leave it and the next session start will report its outcome.`,
 							},
 						],
