@@ -1,7 +1,7 @@
 {
   "name": "pi-bg-tasks",
   "version": "1.0.0",
-  "description": "Background task tools for the pi coding agent: run long commands with bg_run, results auto-push on completion, log tails, timeout kill. Three tools, ~400 tokens of context overhead.",
+  "description": "Background task tools for the pi coding agent: run long commands with bg_run, results auto-push on completion, log tails, timeout kill. Three tools, ~450 tokens of context overhead.",
   "keywords": [
     "pi-package",
     "pi",
