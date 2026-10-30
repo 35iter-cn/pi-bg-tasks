@@ -55,14 +55,65 @@ test("registers five tools and two lifecycle handlers", () => {
 	assert.equal(r.hasShutdown, true);
 });
 
-test("service timeout hint present in bg_run description and schema", () => {
+test("service timeout hint present in bg_run guidelines and schema", () => {
 	const r = scenario(
-		`result = { desc: tools.get("bg_run").description, schema: tools.get("bg_run").parameters.properties.timeoutSeconds.description }`,
+		`result = { guidelines: (tools.get("bg_run").promptGuidelines ?? []).join(" "), schema: tools.get("bg_run").parameters.properties.timeoutSeconds.description }`,
 		{},
 	);
-	assert.match(r.desc, /~10 seconds/);
+	assert.match(r.guidelines, /~10 seconds/);
 	assert.match(r.schema, /86400/);
 	assert.match(r.schema, /outlive the session/);
+});
+
+test("bg_run guidelines carry the service and batch rules, description stays mechanical", () => {
+	const r = scenario(
+		`result = { desc: tools.get("bg_run").description, guidelines: (tools.get("bg_run").promptGuidelines ?? []).join(" | ") }`,
+		{},
+	);
+	assert.match(r.guidelines, /foreground bash/i);
+	assert.match(r.guidelines, /batch/i);
+	assert.match(r.guidelines, /bg_tail/);
+	assert.doesNotMatch(r.desc, /~10 seconds/);
+	assert.doesNotMatch(r.desc, /batch/i);
+});
+
+test("every tool snippet names its bg_run association", () => {
+	const r = scenario(
+		`result = { snippets: Object.fromEntries([...tools.entries()].map(([n, t]) => [n, t.promptSnippet ?? ""])), tailGuidelines: (tools.get("bg_tail").promptGuidelines ?? []).join(" ") }`,
+		{},
+	);
+	assert.match(r.snippets.bg_run, /outside the turn/);
+	for (const name of ["bg_tail", "bg_stop", "bg_list", "bg_gc"]) {
+		assert.match(r.snippets[name], /bg_run/);
+	}
+	assert.match(r.tailGuidelines, /bg_run/);
+});
+
+test("tui start receipt points a service at its log", () => {
+	const r = scenario(
+		`
+		const run = await bgRun({ command: "sleep 30", timeoutSeconds: 60 });
+		result = { text: run.content[0].text };
+		await bgStop(run.details.id);
+		`,
+		{},
+	);
+	assert.match(r.text, /read its log with bg_tail/);
+	assert.doesNotMatch(r.text, /nothing done inside this turn/);
+});
+
+test("bg_tail throttle tells a waiting service to read the log", () => {
+	const r = scenario(
+		`
+		const run = await bgRun({ command: "sleep 30", timeoutSeconds: 60 });
+		await bgTail(run.details.id);
+		const t = await bgTail(run.details.id);
+		result = { text: t.content[0].text };
+		await bgStop(run.details.id);
+		`,
+		{},
+	);
+	assert.match(r.text, /readiness line/);
 });
 
 test("timed-out completion message includes root-cause hint", { timeout: 30_000 }, async () => {
@@ -237,7 +288,8 @@ test("print-mode shutdown keeps the task alive and writes a running ledger", { t
 	assert.equal(r.ownerExitedAt, true);
 	assert.equal(r.reapPolicy, "deadline");
 	assert.equal(r.mode, "print");
-	assert.match(r.text, /will not come back to this turn/);
+	assert.match(r.text, /never returns to this turn/);
+	assert.match(r.text, /readiness/);
 });
 
 test("tui shutdown still uses on-owner-exit policy and kills", { timeout: 30_000 }, async () => {

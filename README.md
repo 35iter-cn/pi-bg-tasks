@@ -6,11 +6,11 @@ Background task tools for the [pi coding agent](https://github.com/badlogic/pi-m
 
 ## Highlights
 
-- **~400 tokens for the three core tools.** Measured static injection for `bg_run` + `bg_tail` + `bg_stop`; the two ops tools (`bg_list`, `bg_gc`) add one short paragraph each. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools.
+- **~800 tokens for the three core tools.** Static injection for `bg_run` + `bg_tail` + `bg_stop`: snippet, guidelines, description and parameter schema, measured at 4 characters per token. Roughly half of it is the guidelines block in the system prompt's rules section — the part that keeps the model from running a server in foreground bash; the two ops tools (`bg_list`, `bg_gc`) add one short paragraph each. The popular community alternative [`pi-background-tasks`](https://www.npmjs.com/package/pi-background-tasks) measures ≈ 5,000 tok with 11 tools.
 - **Five tools, three of them core.** `bg_run` + `bg_tail` + `bg_stop` for the normal loop, plus `bg_list` / `bg_gc` for reattaching to and reaping tasks from earlier sessions. No slash commands, no widgets, no config surface.
 - **Zero dependencies, single file.** One TypeScript file. pi bundles `typebox` and its own API — there is nothing to install. Copy the file into your extensions folder if you don't even want a package.
 - **Survives one-shot sessions.** In `--print` / `json` / `rpc` mode the session may exit within seconds; its tasks keep running under a hard `timeout` watchdog and report back on the next session start.
-- **Fire-and-forget.** The description gives the model one decision rule (~10 seconds and up) and states that a completion arrives as a new turn — so there is nothing to wait for inside the current one. Completion messages are delivered as steering messages that trigger a turn.
+- **Fire-and-forget, with one exception.** The description gives the model one decision rule (~10 seconds and up) and states that a completion arrives as a new turn, so a finite job has nothing to wait for inside the current one. A server never exits, so the same description tells the model to start it here and confirm readiness with one bounded probe (`ss -tlnp`, `curl -m 2`), and never to put a server in one call of a batch and its probe in another — a batch runs in order, so the probe never starts. Completion messages are delivered as steering messages that trigger a turn.
 
 ## What is this?
 
@@ -123,7 +123,7 @@ No — commands run through `/bin/sh`. POSIX systems only.
 It runs arbitrary shell commands with your user's permissions, exactly like pi's built-in bash tool. The usual pi extension security note applies: review the source before installing.
 
 **Does the tool list bloat my context?**
-The three core tools measured ~400 tokens of static injection; the two ops tools are a short paragraph each. See [Highlights](#highlights).
+The three core tools measure ~800 tokens of static injection (snippet + guidelines + description + schema); the two ops tools are a short paragraph each. See [Highlights](#highlights).
 
 **Do tasks survive pi exiting?**
 It depends on the mode. Interactive (`tui`): no, they die with the session, exactly as before. One-shot (`--print`, `json`, `rpc`, which is how chat bridges run pi): yes — they keep running under their `timeout` deadline, and the next session start reports whichever of them finished in the meantime. `bg_list` shows what is still alive, `bg_gc` reaps what nobody owns any more.
