@@ -6,7 +6,7 @@
 
 ## 亮点
 
-- **三个核心工具共 ~450 token 静态注入。** `bg_run` + `bg_tail` + `bg_stop`;两个运维工具(`bg_list`、`bg_gc`)各是一小段描述。
+- **三个核心工具共 ~800 token 静态注入。** 按 snippet + guidelines + description + 参数 schema 计,4 字符算 1 token。其中约一半是系统提示 Rules 段里的 guidelines——就是阻止模型把服务丢进前台 bash 的那部分;两个运维工具(`bg_list`、`bg_gc`)各是一小段描述。
 - **五个工具,三个是主力。** 日常循环用 `bg_run` + `bg_tail` + `bg_stop`;要接手或回收上一个会话留下的任务,用 `bg_list` / `bg_gc`。没有 slash 命令、没有 widget、没有配置面。
 - **零依赖,单文件。** 一个 TypeScript 文件,`typebox` 和 pi API 都是 pi 内置打包——复制到扩展目录就能用,连包管理都不需要。
 - **单轮会话也活得过。** `--print` / `json` / `rpc` 模式下会话可能几秒就退出;它起的任务继续在硬 `timeout` 看门下跑,结果在下一次会话启动时补齐。
@@ -111,7 +111,7 @@ pi update --extensions
 它以你的用户权限运行任意 shell 命令,和 pi 内置 bash 一致。pi 扩展通用安全提醒同样适用:安装前审阅源码。
 
 **会撑大上下文吗?**
-实测每请求静态注入约 450 token,即三个紧凑的工具定义。见[亮点](#亮点)。
+实测每请求静态注入约 800 token(snippet + guidelines + description + schema),即三个紧凑的工具定义。见[亮点](#亮点)。
 
 **pi 退出后任务还活着吗?**
 不。任务归属于会话:会话正常关闭(包括退出 pi)时任务被连带杀掉。仅在 pi 被 SIGKILL/断电这类无法走清理路径的场景下,进程组会残留——属主已死,可在下个会话用 shell 手动清理。

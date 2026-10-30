@@ -55,30 +55,41 @@ test("registers five tools and two lifecycle handlers", () => {
 	assert.equal(r.hasShutdown, true);
 });
 
-test("service timeout hint present in bg_run description and schema", () => {
+test("service timeout hint present in bg_run guidelines and schema", () => {
 	const r = scenario(
-		`result = { desc: tools.get("bg_run").description, schema: tools.get("bg_run").parameters.properties.timeoutSeconds.description }`,
+		`result = { guidelines: (tools.get("bg_run").promptGuidelines ?? []).join(" "), schema: tools.get("bg_run").parameters.properties.timeoutSeconds.description }`,
 		{},
 	);
-	assert.match(r.desc, /~10 seconds/);
+	assert.match(r.guidelines, /~10 seconds/);
 	assert.match(r.schema, /86400/);
 	assert.match(r.schema, /outlive the session/);
 });
 
-test("bg_run description names services, readiness and the batch trap", () => {
+test("bg_run guidelines carry the service and batch rules, description stays mechanical", () => {
 	const r = scenario(
-		`result = { desc: tools.get("bg_run").description, snippet: tools.get("bg_run").promptSnippet }`,
+		`result = { desc: tools.get("bg_run").description, guidelines: (tools.get("bg_run").promptGuidelines ?? []).join(" | ") }`,
 		{},
 	);
-	assert.match(r.desc, /server/i);
-	assert.match(r.desc, /readiness/i);
-	assert.match(r.desc, /probe/i);
-	assert.match(r.desc, /batch/i);
-	assert.match(r.snippet, /Servers, watchers/);
-	assert.doesNotMatch(r.desc, /nothing is gained by waiting inside your turn/);
+	assert.match(r.guidelines, /foreground bash/i);
+	assert.match(r.guidelines, /batch/i);
+	assert.match(r.guidelines, /bg_tail/);
+	assert.doesNotMatch(r.desc, /~10 seconds/);
+	assert.doesNotMatch(r.desc, /batch/i);
 });
 
-test("tui start receipt points a service at a readiness probe", () => {
+test("every tool snippet names its bg_run association", () => {
+	const r = scenario(
+		`result = { snippets: Object.fromEntries([...tools.entries()].map(([n, t]) => [n, t.promptSnippet ?? ""])), tailGuidelines: (tools.get("bg_tail").promptGuidelines ?? []).join(" ") }`,
+		{},
+	);
+	assert.match(r.snippets.bg_run, /outside the turn/);
+	for (const name of ["bg_tail", "bg_stop", "bg_list", "bg_gc"]) {
+		assert.match(r.snippets[name], /bg_run/);
+	}
+	assert.match(r.tailGuidelines, /bg_run/);
+});
+
+test("tui start receipt points a service at its log", () => {
 	const r = scenario(
 		`
 		const run = await bgRun({ command: "sleep 30", timeoutSeconds: 60 });
@@ -87,12 +98,11 @@ test("tui start receipt points a service at a readiness probe", () => {
 		`,
 		{},
 	);
-	assert.match(r.text, /readiness/);
-	assert.match(r.text, /one bounded probe/);
+	assert.match(r.text, /read its log with bg_tail/);
 	assert.doesNotMatch(r.text, /nothing done inside this turn/);
 });
 
-test("bg_tail throttle tells a waiting service to probe, not to sleep", () => {
+test("bg_tail throttle tells a waiting service to read the log", () => {
 	const r = scenario(
 		`
 		const run = await bgRun({ command: "sleep 30", timeoutSeconds: 60 });
@@ -103,7 +113,7 @@ test("bg_tail throttle tells a waiting service to probe, not to sleep", () => {
 		`,
 		{},
 	);
-	assert.match(r.text, /Probe the port or URL/);
+	assert.match(r.text, /readiness line/);
 });
 
 test("timed-out completion message includes root-cause hint", { timeout: 30_000 }, async () => {

@@ -483,9 +483,15 @@ export default function (pi: ExtensionAPI) {
 		name: "bg_run",
 		label: "Background Run",
 		promptSnippet:
-			"Run anything slower than ~10 seconds in the background; returns immediately, result arrives as a new turn. Servers, watchers and dev processes start here too: the bash tool has no background switch, so one there blocks the turn until it exits.",
+			"Run a command outside the turn: builds, tests, servers, watchers, dev processes",
+		promptGuidelines: [
+			"Run anything that may exceed ~10 seconds, or whose duration is unknown, with bg_run; foreground bash only for commands that finish on their own.",
+			"Never run a server, watcher or dev process in foreground bash: it blocks the turn until it exits. Start it with bg_run instead.",
+			"Readiness comes from the bg_run task's own log: bg_tail it right after starting. If the log carries no readiness line, probe the port or URL once with a bounded command. Never wait for a server's exit.",
+			"Never split a bg_run service start and its readiness check across two calls of one batch: a batch runs in order, so the check never starts.",
+		],
 		description:
-			"Run a shell command in the background and return at once with an id and log path. Decide by runtime, not by command type: anything likely to exceed ~10 seconds belongs here, unknown durations included; foreground bash is only for commands that finish on their own. A server never exits, so its exit is not the event you need: start it here, then confirm readiness with one bounded probe (`ss -tlnp`, `curl -m 2`, or `bg_tail <id>`). Never put a server in one call of a batch and its probe in another: a batch runs in order, so the probe never starts. An extra turn is cheap, a blocked turn is not. Completion is pushed as a new message: for a finite job, do independent work or end the turn. Every task carries a hard deadline and is killed when it is reached.",
+			"Run a shell command detached from the turn and return at once with a task id, pid and log path. Everything it prints goes to that log. The process runs until it exits or its deadline kills it; on exit, the last 4 KB of output is pushed back as a new turn.",
 		parameters: BgRunParams,
 		async execute(_toolCallId, params: Static<typeof BgRunParams>) {
 			const dir = resolveLogDir();
@@ -567,7 +573,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Started background task ${name} (${id}), pid ${child.pid}, shell ${shell}, deadline ${timeoutSeconds}s. Log: ${logPath}.${currentMode === "tui" ? " Its result arrives as a new turn when the process exits. For a service, do not wait for that: confirm readiness with one bounded probe, then carry on." : ""}${modeHint()}`,
+						text: `Started background task ${name} (${id}), pid ${child.pid}, shell ${shell}, deadline ${timeoutSeconds}s. Log: ${logPath}.${currentMode === "tui" ? " Its result arrives as a new turn when the process exits. For a service, do not wait for that: read its log with bg_tail, then carry on." : ""}${modeHint()}`,
 					},
 				],
 				details: { id, pid: child.pid, shell },
@@ -578,8 +584,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool<typeof BgTailParams, { id: string }>({
 		name: "bg_tail",
 		label: "Background Tail",
+		promptSnippet: "Read the status and log tail of a task started with bg_run — the readiness check for a service",
+		promptGuidelines: [
+			"Check a bg_run task by id with bg_tail instead of re-running the command or scanning processes: its log is the record that survives the owning session.",
+			"Read a bg_run task's log once to judge progress or readiness, then carry on: for a finite job the completion bg_run pushes is the only exit event.",
+		],
 		description:
-			"Read the status and output tail of a background task. Fallback only — completion is pushed as a new message when the session can receive one. Mid-run reads throttle to once per 30s.",
+			"Read a task started with bg_run by id: its status, the time left before its deadline, and the end of its log (default last 4 KB, up to 64 KB). A finished task's result is pushed by bg_run; reads of a running task are throttled to one per 30 seconds.",
 		parameters: BgTailParams,
 		async execute(_toolCallId, params: Static<typeof BgTailParams>) {
 			const bytes = Math.min(Math.max(params.bytes ?? 4096, 1), 65536);
@@ -605,7 +616,7 @@ export default function (pi: ExtensionAPI) {
 									type: "text",
 									text:
 										currentMode === "tui"
-											? `Task ${id} still running. Waiting for it to finish? End your turn — completion arrives as a new turn and re-reading cannot make it sooner. Waiting for a service to be ready? Probe the port or URL, with one bounded command.`
+											? `Task ${id} still running. Waiting for it to finish? End your turn — completion arrives as a new turn and re-reading cannot make it sooner. Waiting for a service to be ready? Check the log for its readiness line; probe the port only if the log carries none.`
 											: `Task ${id} still running. This session is one-shot, so ending the turn ends the job: read it again later, bg_stop it, or leave it running and the next session start will report its outcome.`,
 								},
 							],
@@ -646,7 +657,7 @@ export default function (pi: ExtensionAPI) {
 								type: "text",
 								text:
 									currentMode === "tui"
-										? `Task ${id} still running (started by another session). Waiting for it to finish? End your turn — its completion is reported when it exits. Waiting for it to be ready? Probe the port or URL, with one bounded command.`
+										? `Task ${id} still running (started by another session). Waiting for it to finish? End your turn — its completion is reported when it exits. Waiting for it to be ready? Check the log for its readiness line; probe the port only if the log carries none.`
 										: `Task ${id} still running (started by another session). This session is one-shot: read it again later, or leave it and the next session start will report its outcome.`,
 							},
 						],
@@ -681,9 +692,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool<typeof BgStopParams, { id: string }>({
 		name: "bg_stop",
 		label: "Background Stop",
-		promptSnippet: "Stop a background task started in this session",
+		promptSnippet: "Stop a bg_run task — this session's or an orphan from an earlier one — killing its whole process group",
+		promptGuidelines: [
+			"Prefer bg_stop over shelling out kill: it addresses the process group by task id and never hits a recycled pid.",
+			"Stop a service with bg_stop when you are done: an unstopped 24h task lingers as an orphan holding its port.",
+		],
 		description:
-			"Stop a background task started in this session. Kills the whole process group (SIGTERM, then SIGKILL after 5s). Prefer this over shelling out to kill.",
+			"Stop a task started with bg_run, given its id or an unambiguous prefix. The whole process group is signalled (SIGTERM, then SIGKILL after 5 seconds) and the task record is closed; a task from an earlier session is resolved from disk with its pid validated against the recorded start time.",
 		parameters: BgStopParams,
 		async execute(_toolCallId, params: Static<typeof BgStopParams>) {
 			const resolved = resolveTask(params.id);
@@ -747,9 +762,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool<typeof BgListParams, { ids: string[] }>({
 		name: "bg_list",
 		label: "Background List",
-		promptSnippet: "List background tasks, including ones started by earlier sessions",
+		promptSnippet: "List bg_run tasks on this machine, including ones from earlier sessions — check before starting a duplicate service",
+		promptGuidelines: [
+			"Run bg_list before starting a service: a task from an earlier session may still hold the port, and the second start fails on bind.",
+		],
 		description:
-			"List background tasks known on this machine, newest first, including tasks started by a previous session that outlived it. Use it to reattach to a service before starting a duplicate. orphans=true filters to tasks whose owning session is gone.",
+			"List every bg_run task recorded on this machine, newest first: id, state, reap policy, age, whether the owning session is still alive, and the log path. orphans=true narrows the list to tasks whose owning session is gone.",
 		parameters: BgListParams,
 		async execute(_toolCallId, params: Static<typeof BgListParams>) {
 			const ledgers = listLedgers();
@@ -778,9 +796,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool<typeof BgGcParams, { reaped: number }>({
 		name: "bg_gc",
 		label: "Background Collect",
-		promptSnippet: "Reap background tasks whose owner is gone or whose deadline passed",
+		promptSnippet: "Reap bg_run tasks nobody owns any more: owner gone or deadline passed",
 		description:
-			"Reap background tasks that nobody owns any more: kills tasks marked on-owner-exit whose owning session is gone, and tasks past their deadline, and marks dead processes as lost. dryRun reports without killing.",
+			"Reap bg_run tasks that nobody owns any more: kill tasks marked on-owner-exit whose owning session is gone, kill tasks past their deadline, and mark vanished processes as lost. Session start already reaps what it can, so this is for what that sweep could not reach. dryRun reports without killing.",
 		parameters: BgGcParams,
 		async execute(_toolCallId, params: Static<typeof BgGcParams>) {
 			const actions: string[] = [];
