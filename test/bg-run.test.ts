@@ -179,6 +179,61 @@ test("bg_stop kills the process group immediately", { timeout: 30_000 }, async (
 	assert.equal(r.afterGrace, false);
 });
 
+test("bg_stop stops the command itself, not only the wrapper shell", { timeout: 30_000 }, async () => {
+	const marker = `bg-sentinel-stop-${process.pid}-${Math.floor(Math.random() * 1e6)}`;
+	const r = scenario(
+		`
+		const { execSync } = await import("node:child_process");
+		const run = await bgRun({ command: "exec -a ${marker} sleep 300", name: "stop-sentinel" });
+		await new Promise(r => setTimeout(r, 500));
+		await bgStop(run.details.id);
+		await new Promise(r => setTimeout(r, 3000));
+		result = { survivors: Number(execSync("ps -eo args | grep -c '[b]${marker.slice(2)}' || true").toString().trim() || 0) };
+		`,
+		{},
+	);
+	assert.equal(r.survivors, 0);
+});
+
+test("timeout stops the command itself, not only the wrapper shell", { timeout: 30_000 }, async () => {
+	const marker = `bg-sentinel-deadline-${process.pid}-${Math.floor(Math.random() * 1e6)}`;
+	const r = scenario(
+		`
+		const { execSync } = await import("node:child_process");
+		await bgRun({ command: "exec -a ${marker} sleep 300", timeoutSeconds: 1, name: "deadline-sentinel" });
+		await new Promise(r => setTimeout(r, 4000));
+		result = { survivors: Number(execSync("ps -eo args | grep -c '[b]${marker.slice(2)}' || true").toString().trim() || 0) };
+		`,
+		{},
+	);
+	assert.equal(r.survivors, 0);
+});
+
+test("bg_stop still reaches the command when timeout lacks --foreground", { timeout: 30_000 }, async () => {
+	const marker = `bg-sentinel-noflag-${process.pid}-${Math.floor(Math.random() * 1e6)}`;
+	const fakeDir = join(tmpdir(), `bg-fake-timeout-${process.pid}-${Math.floor(Math.random() * 1e6)}`);
+	mkdirSync(fakeDir, { recursive: true });
+	writeFileSync(
+		join(fakeDir, "timeout"),
+		'#!/bin/sh\ncase "$1" in --version) echo "timeout (GNU coreutils) 9.0"; exit 0;; esac\necho "Usage: timeout [OPTION] DURATION COMMAND"; exit 0\n',
+		{ mode: 0o755 },
+	);
+	const r = scenario(
+		`
+		const { execSync } = await import("node:child_process");
+		const run = await bgRun({ command: "exec -a ${marker} sleep 300", name: "noflag-sentinel" });
+		await new Promise(r => setTimeout(r, 500));
+		await bgStop(run.details.id);
+		await new Promise(r => setTimeout(r, 3000));
+		result = { survivors: Number(execSync("ps -eo args | grep -c '[b]${marker.slice(2)}' || true").toString().trim() || 0) };
+		`,
+		{},
+		{ PATH: `${fakeDir}:${process.env.PATH ?? ""}` },
+	);
+	rmSync(fakeDir, { recursive: true, force: true });
+	assert.equal(r.survivors, 0);
+});
+
 test("bg_stop escalates to SIGKILL when SIGTERM is ignored", { timeout: 30_000 }, async () => {
 	const r = scenario(
 		`
