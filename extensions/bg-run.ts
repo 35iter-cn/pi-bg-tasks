@@ -95,10 +95,17 @@ function resolveShell(): string {
 	return (resolvedShell = "/bin/sh");
 }
 
-function hasTimeoutCommand(): boolean {
+/**
+ * `timeout` is only usable as the deadline mechanism when it supports `--foreground`:
+ * without that flag GNU timeout puts the command in its own process group, so killing the
+ * group recorded for the task (the outer shell) leaves the real command running.
+ */
+function supportsForegroundTimeout(): boolean {
 	if (timeoutAvailable !== undefined) return timeoutAvailable;
 	try {
-		timeoutAvailable = spawnSync("timeout", ["--version"], { stdio: "ignore" }).status === 0;
+		if (spawnSync("timeout", ["--version"], { stdio: "ignore" }).status !== 0) return (timeoutAvailable = false);
+		const help = spawnSync("timeout", ["--help"], { encoding: "utf8" });
+		timeoutAvailable = (help.stdout ?? "").includes("--foreground");
 	} catch {
 		timeoutAvailable = false;
 	}
@@ -322,7 +329,6 @@ function killTask(task: Task): void {
 		process.kill(-pid, "SIGTERM");
 	} catch {}
 	const grace = setTimeout(() => {
-		if (task.exited) return;
 		if (!groupAlive(pid)) return;
 		try {
 			process.kill(-pid, "SIGKILL");
@@ -531,8 +537,9 @@ export default function (pi: ExtensionAPI) {
 			const exitFile = exitPath(id);
 			const logFd = openSync(logPath, "a");
 			const reapPolicy: ReapPolicy = currentMode === "tui" ? "on-owner-exit" : "deadline";
-			const inner = hasTimeoutCommand()
-				? `timeout -k 5 ${timeoutSeconds} ${shell} -c ${shellQuote(params.command)}`
+			const usesTimeout = supportsForegroundTimeout();
+			const inner = usesTimeout
+				? `timeout --foreground -k 5 ${timeoutSeconds} ${shell} -c ${shellQuote(params.command)}`
 				: `${shell} -c ${shellQuote(params.command)}`;
 			const script = `${inner}; code=$?; printf '%s %s\\n' "$code" "$(date +%s)" > ${shellQuote(exitFile)}; if [ "$code" = 124 ] || [ "$code" = 137 ]; then kill -KILL 0 2>/dev/null; fi`;
 			const child = spawn(shell, ["-c", script], {
@@ -564,7 +571,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			tasks.set(id, task);
 			writeLedger(ledgerFromTask(task));
-			if (!hasTimeoutCommand()) {
+			if (!usesTimeout) {
 				task.killTimer = setTimeout(() => {
 					task.timedOut = true;
 					killTask(task);

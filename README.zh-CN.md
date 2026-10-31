@@ -31,7 +31,7 @@ pi 内置 `bash` 工具会阻塞 agent 直到命令退出。对 dev server、构
 ## 会话生命周期
 
 - **回收跟随运行模式。** 交互式(`tui`)会话关掉时,仍会杀掉自己起的全部任务;一次性运行(`--print`、`json`、`rpc`,也就是各种聊天桥的跑法)关掉时**不杀**,只在台账里记下 owner 已退出,结果留到下一次会话启动时报告。
-- **每个任务都有硬 deadline。** 命令跑在 `timeout -k 5 <timeoutSeconds>` 之下,即使起它的 pi 进程早就没了,到点照样死;超时会整组击杀,连包装层没亲自 fork 的孙进程一起收。
+- **每个任务都有硬 deadline。** 命令跑在 `timeout --foreground -k 5 <timeoutSeconds>` 之下,即使起它的 pi 进程早就没了,到点照样死;超时会整组击杀,连包装层没亲自 fork 的孙进程一起收。
 - **状态落盘,不靠进程内存。** `~/.pi/agent/bg-tasks/<id>.json`(台账:pid、pgid、`starttime`、deadline、owner、回收策略、状态)与 `<id>.exit`(退出码 + 结束时间)。退出事件能跨进程可见,靠的就是这两份文件。
 
 ## 安装
@@ -94,7 +94,7 @@ pi update --extensions
 ## 工作原理
 
 - 输出写入 `~/.pi/agent/bg-tasks/<timestamp>-<id>.log`;会话启动时自动清理 7 天前的旧日志。
-- 进程以 detached 方式跑在独立进程组,超时或 `bg_stop` 先 `SIGTERM`、1 秒宽限后 `SIGKILL` 整组击杀。超时强杀时,完成消息明确告知根因(到点被杀),提示模型若为常驻服务应用 `bg_run` 加更大的 timeoutSeconds 重启。
+- 进程以 detached 方式跑在独立进程组,超时或 `bg_stop` 先 `SIGTERM`、1 秒宽限后 `SIGKILL` 整组击杀。`timeout` 自身带 `--foreground`,否则 GNU timeout 会另建一个进程组,`bg_stop` 就只杀得到外层 shell;`timeout` 不支持该选项时任务不包 `timeout`,改由进程内定时器兜底。超时强杀时,完成消息明确告知根因(到点被杀),提示模型若为常驻服务应用 `bg_run` 加更大的 timeoutSeconds 重启。
 - **任务归属于启动它的会话**:会话关闭(`/new`、切换、fork、恢复、退出 pi)时,`session_shutdown` 会杀掉该会话启动的全部任务;其他并行 pi 实例的任务不受影响。
 - 任务退出时,把带 4 KB 输出尾部的完成消息以 `triggerTurn` 的 steering 消息送达,agent 即时接手。
 - 会话替换安全:`/new`、fork、切换会话或 `/reload` 之后,过期通知会被静默丢弃而不是崩掉 pi;日志仍在磁盘,`bg_tail` 随时可查。注意:`/new` 等会话替按设计会先杀本会话任务,此时收到的是被杀后的退出通知。
