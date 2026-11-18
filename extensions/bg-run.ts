@@ -195,14 +195,11 @@ function wakeShell(input: {
 	name: string;
 	platform: string;
 	key: string;
-	ownerPid: number;
-	ownerTicks: string | undefined;
 	logPath: string;
 	wakeFile: string;
 	startedSeconds: number;
 }): string {
 	const q = shellQuote;
-	const ticks = q(input.ownerTicks ?? "");
 	return [
 		"",
 		`task_name=${q(input.name)}`,
@@ -219,19 +216,10 @@ function wakeShell(input: {
 		"  124|137) note='，到点被杀' ;;",
 		"  *) note='' ;;",
 		"esac",
-		"owner_alive() {",
-		`  s=$(cat /proc/${input.ownerPid}/stat 2>/dev/null) || return 1`,
-		`  [ -z ${ticks} ] && return 0`,
-		"  s=${s#*) }",
-		"  set -- $s",
-		"  shift 19",
-		`  [ "$1" = ${ticks} ]`,
-		"}",
 		"wake() {",
-		"  owner_alive && return 0",
 		`  body=$(tail -c ${WAKE_TAIL_BYTES} "$task_log" | tr -d '\\000') || return 1`,
-		'  prompt="自动唤醒：后台任务 $task_name ($task_id) 已结束（rc=$code$note，耗时 $(( $(date +%s) - task_start ))s，日志 $task_log）。这不是用户发言。',
-		"它在上一轮 job 退出之后才结束，结果没有投递到会话。以下为日志尾部；需要完整内容用 bg_tail $task_id。",
+		'  prompt="后台任务 $task_name ($task_id) 已结束（rc=$code$note，耗时 $(( $(date +%s) - task_start ))s，日志 $task_log）。',
+		"以下为日志尾部；需要完整内容用 bg_tail $task_id。",
 		"",
 		'$body"',
 		"  if ! command -v agent-relay >/dev/null 2>&1; then",
@@ -242,7 +230,7 @@ function wakeShell(input: {
 		"  fi",
 		"  i=0",
 		"  while :; do",
-		"    out=$(printf '%s\\n' \"$prompt\" | timeout \"$cli_seconds\" agent-relay schedule --platform \"$task_platform\" --key \"$task_key\" --name \"$task_wake_name\" --in 0s 2>&1)",
+		"    out=$(printf '%s\\n' \"$prompt\" | timeout \"$cli_seconds\" agent-relay schedule --platform \"$task_platform\" --key \"$task_key\" --name \"$task_wake_name\" --in 0s --join 2>&1)",
 		"    rcx=$?",
 		"    printf 'wake: rc=%s %s\\n' \"$rcx\" \"$out\" >> \"$task_log\"",
 		'    [ "$rcx" = 1 ] && [ "$i" -lt 2 ] || break',
@@ -682,8 +670,6 @@ export default function (pi: ExtensionAPI) {
 							id,
 							name,
 							...relayIdentity(),
-							ownerPid: process.pid,
-							ownerTicks: readStat(process.pid),
 							logPath,
 							wakeFile: wakePath(id),
 							startedSeconds: Math.floor(startedAt / 1000),
@@ -743,18 +729,20 @@ export default function (pi: ExtensionAPI) {
 				const tail = readTail(logPath, NOTIFY_TAIL_BYTES);
 				const status: TaskStatus = task.timedOut ? "timedout" : signal ? "killed" : "exited";
 				const suffix = statusLine(status, code, signal, task.timeoutSeconds);
-				try {
-					pi.sendMessage(
-						{
-							customType: "minimal-bg",
-							content: `Background task ${name} (${id}) ${suffix}\nLog: ${logPath}\n${tail}`,
-							display: true,
-							details: { id, name, exitCode: code, signal, timedOut: task.timedOut, logPath },
-						},
-						{ triggerTurn: true, deliverAs: "steer" },
-					);
-					task.notified = true;
-				} catch {}
+				if (task.wake !== "on") {
+					try {
+						pi.sendMessage(
+							{
+								customType: "minimal-bg",
+								content: `Background task ${name} (${id}) ${suffix}\nLog: ${logPath}\n${tail}`,
+								display: true,
+								details: { id, name, exitCode: code, signal, timedOut: task.timedOut, logPath },
+							},
+							{ triggerTurn: true, deliverAs: "steer" },
+						);
+						task.notified = true;
+					} catch {}
+				}
 				writeLedger(ledgerFromTask(task));
 			});
 			child.unref();
