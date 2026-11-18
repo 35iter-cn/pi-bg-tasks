@@ -565,8 +565,8 @@ test("TC-BW1 a task that outlives its job schedules one wake round into the same
 	await new Promise((res) => setTimeout(res, 4500));
 	const record = readFileSync(w.record, "utf8");
 	assert.match(record, new RegExp(`^argv schedule --platform fake --key th-wake --name bg-${started.id} --in 0s --join$`, "m"));
-	assert.match(record, new RegExp(`自动唤醒：后台任务 wake-me \\(${started.id}\\) 已结束（rc=0，耗时 \\d+s`));
-	assert.match(record, /它在上一轮 job 退出之后才结束/);
+	assert.match(record, new RegExp(`后台任务 wake-me \\(${started.id}\\) 已结束（rc=0，耗时 \\d+s`));
+	assert.doesNotMatch(record, /这不是用户发言|上一轮 job 退出之后/);
 	assert.match(record, /bg_tail [0-9a-f]{8}/);
 	assert.match(record, /tail-line/);
 	assert.equal(wakeFileOf(w.bg, started.id), "0");
