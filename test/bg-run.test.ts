@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -500,4 +500,213 @@ test("bg_tail reports no new output instead of throttling", { timeout: 30_000 },
 	);
 	assert.match(r.text, /No new output since the last read/);
 	assert.doesNotMatch(r.text, /throttl|one-shot|End your turn/);
+});
+
+const BARE_PATH = `${dirname(process.execPath)}:/usr/bin:/bin`;
+
+function fakeRelay(dir: string, script: string): string {
+	mkdirSync(dir, { recursive: true });
+	const path = join(dir, "agent-relay");
+	writeFileSync(path, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+	return path;
+}
+
+const RECORDING_RELAY = [
+	"{ printf 'argv %s\\n' \"$*\" >> \"$WAKE_RECORD\"; }",
+	'cat >> "$WAKE_RECORD"',
+	"printf '---\\n' >> \"$WAKE_RECORD\"",
+	'[ -n "$FAKE_STDERR" ] && printf \'%s\\n\' "$FAKE_STDERR" >&2',
+	'exit ${FAKE_RC:-0}',
+].join("\n");
+
+function wakeFixture(extra: Record<string, string> = {}) {
+	const dir = join(tmpdir(), `bg-wake-${process.pid}-${Math.random().toString(16).slice(2, 10)}`);
+	const bin = join(dir, "bin");
+	fakeRelay(bin, RECORDING_RELAY);
+	const bg = join(dir, "bg");
+	mkdirSync(bg, { recursive: true });
+	const record = join(dir, "wake-record.txt");
+	return {
+		dir,
+		bin,
+		bg,
+		record,
+		env: {
+			BG_RUN_DIR: bg,
+			WAKE_RECORD: record,
+			...extra,
+		} as Record<string, string>,
+	};
+}
+
+const ledgerOf = (bg: string, id: string) =>
+	JSON.parse(readFileSync(join(bg, `${id}.json`), "utf8")) as { wake?: string; wakeNote?: string; logPath: string };
+const wakeFileOf = (bg: string, id: string) => {
+	try {
+		return readFileSync(join(bg, `${id}.wake`), "utf8").trim();
+	} catch {
+		return null;
+	}
+};
+
+test("TC-BW1 a task that outlives its job schedules one wake round into the same conversation", { timeout: 60_000 }, async () => {
+	const w = wakeFixture({ AGENT_RELAY_PLATFORM: "fake", AGENT_RELAY_KEY: "th-wake" });
+	w.env.PATH = `${w.bin}:${process.env.PATH ?? ""}`;
+	const started = scenario(
+		`
+		${startSession("print", "sess-wake")}
+		const run = await bgRun({ command: "sleep 2; echo tail-line", name: "wake-me", timeoutSeconds: 30 });
+		result = { id: run.details.id, receipt: run.content[0].text };
+		`,
+		{},
+		w.env,
+	);
+	await new Promise((res) => setTimeout(res, 4500));
+	const record = readFileSync(w.record, "utf8");
+	assert.match(record, new RegExp(`^argv schedule --platform fake --key th-wake --name bg-${started.id} --in 0s$`, "m"));
+	assert.match(record, new RegExp(`自动唤醒：后台任务 wake-me \\(${started.id}\\) 已结束（rc=0，耗时 \\d+s`));
+	assert.match(record, /它在上一轮 job 退出之后才结束/);
+	assert.match(record, /bg_tail [0-9a-f]{8}/);
+	assert.match(record, /tail-line/);
+	assert.equal(wakeFileOf(w.bg, started.id), "0");
+	assert.match(started.receipt, /wake=on/);
+	assert.equal(ledgerOf(w.bg, started.id).wake, "on");
+});
+
+test("TC-BW2 a task that ends while its job is still alive does not wake", { timeout: 60_000 }, async () => {
+	const w = wakeFixture({ PATH: BARE_PATH, AGENT_RELAY_PLATFORM: "fake", AGENT_RELAY_KEY: "th-wake" });
+	w.env.PATH = `${w.bin}:${BARE_PATH}`;
+	const r = scenario(
+		`
+		${startSession("print", "sess-alive")}
+		const run = await bgRun({ command: "sleep 1", name: "short", timeoutSeconds: 30 });
+		await new Promise(res => setTimeout(res, 2200));
+		result = { id: run.details.id, receipt: run.content[0].text };
+		`,
+		{},
+		w.env,
+	);
+	assert.match(r.receipt, /wake=on/);
+	assert.equal(existsSync(w.record), false);
+	assert.equal(wakeFileOf(w.bg, r.id), null);
+	assert.equal(ledgerOf(w.bg, r.id).wake, "on");
+});
+
+test("TC-BW3 wakeOnExit false keeps the conversation out of it", { timeout: 60_000 }, async () => {
+	const w = wakeFixture({ AGENT_RELAY_PLATFORM: "fake", AGENT_RELAY_KEY: "th-wake" });
+	w.env.PATH = `${w.bin}:${process.env.PATH ?? ""}`;
+	const started = scenario(
+		`
+		${startSession("print", "sess-off")}
+		const run = await bgRun({ command: "sleep 1; echo done", name: "off-me", wakeOnExit: false, timeoutSeconds: 30 });
+		result = { id: run.details.id, receipt: run.content[0].text };
+		`,
+		{},
+		w.env,
+	);
+	await new Promise((res) => setTimeout(res, 3000));
+	assert.match(started.receipt, /wake=off/);
+	assert.equal(ledgerOf(w.bg, started.id).wake, "off");
+	assert.equal(wakeFileOf(w.bg, started.id), null);
+	assert.equal(existsSync(w.record), false);
+});
+
+test("TC-BW4 an interactive session neither wakes nor logs a wake line", { timeout: 60_000 }, async () => {
+	const w = wakeFixture();
+	w.env.PATH = `${w.bin}:${process.env.PATH ?? ""}`;
+	const started = scenario(
+		`
+		${startSession("print", "sess-plain")}
+		const run = await bgRun({ command: "sleep 1; echo done", name: "plain", timeoutSeconds: 30 });
+		result = { id: run.details.id, receipt: run.content[0].text };
+		`,
+		{},
+		w.env,
+	);
+	await new Promise((res) => setTimeout(res, 3000));
+	assert.match(started.receipt, /wake=off/);
+	assert.equal(ledgerOf(w.bg, started.id).wake, "off");
+	assert.equal(wakeFileOf(w.bg, started.id), null);
+	assert.equal(existsSync(w.record), false);
+	assert.doesNotMatch(readFileSync(ledgerOf(w.bg, started.id).logPath, "utf8"), /wake:/);
+});
+
+test("TC-BW5 no agent-relay on PATH is reported at once and skipped at exit", { timeout: 60_000 }, async () => {
+	const w = wakeFixture({ PATH: BARE_PATH, AGENT_RELAY_PLATFORM: "fake", AGENT_RELAY_KEY: "th-wake" });
+	const started = scenario(
+		`
+		${startSession("print", "sess-nocli")}
+		const run = await bgRun({ command: "sleep 1; echo done", name: "nocli", timeoutSeconds: 30 });
+		result = { id: run.details.id, receipt: run.content[0].text };
+		`,
+		{},
+		w.env,
+	);
+	await new Promise((res) => setTimeout(res, 3000));
+	assert.match(started.receipt, /唤醒不可用/);
+	assert.match(started.receipt, /wake=unavailable/);
+	assert.equal(ledgerOf(w.bg, started.id).wake, "unavailable");
+	assert.equal(wakeFileOf(w.bg, started.id), null);
+	assert.doesNotMatch(readFileSync(ledgerOf(w.bg, started.id).logPath, "utf8"), /wake:/);
+});
+
+test("TC-BW6 a CLI that disappears before the task ends records cli-missing", { timeout: 60_000 }, async () => {
+	const w = wakeFixture({ PATH: BARE_PATH, AGENT_RELAY_PLATFORM: "fake", AGENT_RELAY_KEY: "th-wake" });
+	const cli = join(w.bin, "agent-relay");
+	w.env.PATH = `${w.bin}:${BARE_PATH}`;
+	const started = scenario(
+		`
+		${startSession("print", "sess-vanish")}
+		const fs = await import("node:fs");
+		const run = await bgRun({ command: "sleep 2", name: "vanish", timeoutSeconds: 30 });
+		fs.unlinkSync(${JSON.stringify(cli)});
+		result = { id: run.details.id, receipt: run.content[0].text };
+		`,
+		{},
+		w.env,
+	);
+	await new Promise((res) => setTimeout(res, 4500));
+	assert.match(started.receipt, /wake=on/);
+	assert.equal(wakeFileOf(w.bg, started.id), "127");
+	const log = readFileSync(ledgerOf(w.bg, started.id).logPath, "utf8");
+	assert.match(log, /wake: cli-missing/);
+	assert.match(log, /wake: rc=127/);
+	assert.equal(existsSync(w.record), false);
+});
+
+test("TC-BW7 a down daemon is retried three times, a refusal is not", { timeout: 60_000 }, async () => {
+	const down = wakeFixture({ PATH: BARE_PATH, AGENT_RELAY_PLATFORM: "fake", AGENT_RELAY_KEY: "th-wake", BG_RUN_WAKE_RETRY_SECONDS: "1", FAKE_RC: "1" });
+	down.env.PATH = `${down.bin}:${BARE_PATH}`;
+	const first = scenario(
+		`
+		${startSession("print", "sess-down")}
+		const run = await bgRun({ command: "sleep 1", name: "down", timeoutSeconds: 30 });
+		result = { id: run.details.id };
+		`,
+		{},
+		down.env,
+	);
+	await new Promise((res) => setTimeout(res, 6000));
+	assert.equal(wakeFileOf(down.bg, first.id), "1");
+	const downLog = readFileSync(ledgerOf(down.bg, first.id).logPath, "utf8");
+	assert.equal(downLog.match(/^wake: rc=1 /gm)?.length, 3);
+	assert.match(downLog, /wake: daemon-down/);
+
+	const refused = wakeFixture({ PATH: BARE_PATH, AGENT_RELAY_PLATFORM: "fake", AGENT_RELAY_KEY: "th-wake", BG_RUN_WAKE_RETRY_SECONDS: "1", FAKE_RC: "3", FAKE_STDERR: "refused: name-taken" });
+	refused.env.PATH = `${refused.bin}:${BARE_PATH}`;
+	const second = scenario(
+		`
+		${startSession("print", "sess-refused")}
+		const run = await bgRun({ command: "sleep 1", name: "refused", timeoutSeconds: 30 });
+		result = { id: run.details.id };
+		`,
+		{},
+		refused.env,
+	);
+	await new Promise((res) => setTimeout(res, 4000));
+	assert.equal(wakeFileOf(refused.bg, second.id), "3");
+	const refusedLog = readFileSync(ledgerOf(refused.bg, second.id).logPath, "utf8");
+	assert.equal(refusedLog.match(/^wake: rc=3 /gm)?.length, 1);
+	assert.match(refusedLog, /refused: name-taken/);
+	assert.match(refusedLog, /wake: refused/);
 });

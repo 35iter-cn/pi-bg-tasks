@@ -65,6 +65,7 @@ pi update --extensions
 | `command` | string, required | Shell command to run (via `/bin/sh -c`) |
 | `name` | string, optional | Short task name; defaults to the first words of the command |
 | `timeoutSeconds` | number, optional | Kill the task after this many seconds. Default 1800, max 86400. A service meant to outlive the session needs 86400 — the default is a runaway guard, not a lifespan |
+| `wakeOnExit` | boolean, optional | Wake this conversation when the task ends after the owning job has exited. Defaults on in a relay worker that can reach `agent-relay` — see [Waking the conversation](#waking-the-conversation) |
 
 Returns immediately with a task id, pid, and log path.
 
@@ -101,6 +102,23 @@ Newest first, with status, reap policy, age, whether the owner is still alive, a
 
 Kills tasks marked `on-owner-exit` whose owner is gone, kills tasks past their deadline, and marks vanished processes as `lost`.
 
+## Waking the conversation
+
+A chat bridge runs one pi process per turn, so a task started in that turn can end long after the process is gone. Inside a relay worker (`AGENT_RELAY_PLATFORM` and `AGENT_RELAY_KEY` both set, mode not `tui`, `agent-relay` on `PATH`) `bg_run` appends a wake step to the task's own shell: when the command ends, the step compares `/proc/<owner>/stat` field 22 with the start ticks recorded at spawn, and if the owning process is gone it runs `agent-relay schedule --in 0s` against the same conversation key. The scheduled round resumes the same session, so the result comes back to the conversation that started the task.
+
+| Situation | Behaviour |
+|---|---|
+| Task ends, owner alive | no wake — the in-turn steering message already delivered it |
+| Task ends, owner gone | one wake round; its prompt starts with `自动唤醒` and carries rc, elapsed seconds and the last 2 KB of the log |
+| Not a relay worker (interactive pi, `tui`) | `wake=off` in the start receipt; no wake step exists |
+| `wakeOnExit: false` | off on request, even in a relay worker |
+| No `agent-relay` on `PATH` at `bg_run` | `wake=unavailable` in the receipt and the ledger; nothing runs at exit |
+| `agent-relay` gone by exit | `<id>.wake` holds `127`, the log says `wake: cli-missing` |
+| Daemon down (exit 1) | three attempts 20 s apart; `<id>.wake` holds `1`, the log says `wake: daemon-down` |
+| Refused (exit 3, e.g. `name-taken`) | one attempt; `<id>.wake` holds `3`, the reason is in the log |
+
+The wake never changes the task's own exit code and each CLI call is capped at 20 s. `<id>.wake` holds the CLI's exit code (or `failed` when the step itself broke); the ledger's `wake` field holds what was decided at start. `BG_RUN_WAKE_RETRY_SECONDS` and `BG_RUN_WAKE_CLI_SECONDS` shorten the retry gap and the CLI budget.
+
 ## How it works
 
 - Output goes to `~/.pi/agent/bg-tasks/<timestamp>-<id>.log`; logs older than 7 days are cleaned up on session start.
@@ -126,7 +144,7 @@ It runs arbitrary shell commands with your user's permissions, exactly like pi's
 The three core tools measure ~800 tokens of static injection (snippet + guidelines + description + schema); the two ops tools are a short paragraph each. See [Highlights](#highlights).
 
 **Do tasks survive pi exiting?**
-It depends on the mode. Interactive (`tui`): no, they die with the session, exactly as before. One-shot (`--print`, `json`, `rpc`, which is how chat bridges run pi): yes — they keep running under their `timeout` deadline, and the next session start reports whichever of them finished in the meantime. `bg_list` shows what is still alive, `bg_gc` reaps what nobody owns any more.
+It depends on the mode. Interactive (`tui`): no, they die with the session, exactly as before. One-shot (`--print`, `json`, `rpc`, which is how chat bridges run pi): yes — they keep running under their `timeout` deadline, and the next session start reports whichever of them finished in the meantime. In a relay worker the task also wakes its own conversation when it ends after the turn — see [Waking the conversation](#waking-the-conversation). `bg_list` shows what is still alive, `bg_gc` reaps what nobody owns any more.
 
 **Is there a chance a task outlives everything?**
 No. The deadline is enforced by `timeout` inside the task's own process group, so it does not depend on pi being alive. `bg_gc` and the session-start sweep only clean up earlier.

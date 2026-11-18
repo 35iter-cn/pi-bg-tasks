@@ -71,6 +71,7 @@ pi update --extensions
 | `command` | string,必填 | 要后台执行的 shell 命令(经 `/bin/sh -c`) |
 | `name` | string,可选 | 任务短名;缺省取命令前几个词 |
 | `timeoutSeconds` | number,可选 | 超时秒数,到点强杀。默认 1800,上限 86400(要活过会话的服务传 86400——默认值是失控保底,不是寿命) |
+| `wakeOnExit` | boolean,可选 | 任务在本轮 job 退出之后结束时是否唤醒本会话。relay worker 里且能调 `agent-relay` 时默认开启,见[跨 worker 唤醒](#跨-worker-唤醒) |
 
 立即返回任务 id、pid 和日志路径。
 
@@ -90,6 +91,23 @@ pi update --extensions
 | `bytes` | number,可选 | 日志尾部最大字节数。默认 4096,上限 65536 |
 
 重复读取只返回上次读之后新增的内容,没有新增就直接说。
+
+## 跨 worker 唤醒
+
+聊天桥一轮一个 pi 进程,所以这一轮起的任务经常在进程退出之后才结束。在 relay worker 里(`AGENT_RELAY_PLATFORM` 与 `AGENT_RELAY_KEY` 都在、模式不是 `tui`、`PATH` 里有 `agent-relay`),`bg_run` 会给任务的 shell 尾部加一段唤醒步骤:命令结束时用 `/proc/<owner>/stat` 第 22 字段与启动时记下的 starttime 比对,属主已退出就对这个会话 key 执行 `agent-relay schedule --in 0s`;排上的这一轮续同一个 session,把结果带回会话。
+
+| 情形 | 行为 |
+|---|---|
+| 任务结束、属主还活着 | 不唤醒,轮内的 steering 消息已经投递 |
+| 任务结束、属主已退出 | 唤醒一轮;prompt 首行是`自动唤醒`,带 rc、耗时与日志最后 2 KB |
+| 不是 relay worker(交互 pi、`tui`) | 回执写 `wake=off`,脚本里根本没有唤醒步骤 |
+| `wakeOnExit: false` | 显式关掉,relay worker 里也不唤醒 |
+| `bg_run` 时 `PATH` 里没有 `agent-relay` | 回执与账本记 `wake=unavailable`,退出时什么都不做 |
+| 任务结束时 CLI 已经不在了 | `<id>.wake` 为 `127`,日志写 `wake: cli-missing` |
+| 守护进程没跑(exit 1) | 间隔 20 秒重试三次;`<id>.wake` 为 `1`,日志写 `wake: daemon-down` |
+| 被拒(exit 3,如 `name-taken`) | 只试一次;`<id>.wake` 为 `3`,原因在日志里 |
+
+唤醒不改任务自身的退出码,每次 CLI 调用封顶 20 秒。`<id>.wake` 存 CLI 的退出码(唤醒步骤自身报错时为 `failed`);账本的 `wake` 字段存启动时的判定。`BG_RUN_WAKE_RETRY_SECONDS` 与 `BG_RUN_WAKE_CLI_SECONDS` 可缩短重试间隔与 CLI 时限。
 
 ## 工作原理
 
@@ -114,7 +132,7 @@ pi update --extensions
 实测每请求静态注入约 800 token(snippet + guidelines + description + schema),即三个紧凑的工具定义。见[亮点](#亮点)。
 
 **pi 退出后任务还活着吗?**
-不。任务归属于会话:会话正常关闭(包括退出 pi)时任务被连带杀掉。仅在 pi 被 SIGKILL/断电这类无法走清理路径的场景下,进程组会残留——属主已死,可在下个会话用 shell 手动清理。
+不。任务归属于会话:会话正常关闭(包括退出 pi)时任务被连带杀掉。仅在 pi 被 SIGKILL/断电这类无法走清理路径的场景下,进程组会残留——属主已死,可在下个会话用 shell 手动清理。在 relay worker 里,任务在轮次退出之后结束时还会唤醒自己所在的会话,见[跨 worker 唤醒](#跨-worker-唤醒)。
 
 ## License
 

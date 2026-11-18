@@ -10,6 +10,8 @@ import {
 	readFileSync,
 	writeFileSync,
 	renameSync,
+	accessSync,
+	constants,
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -24,11 +26,15 @@ const MAX_TIMEOUT_SECONDS = 86400;
 const NOTIFY_TAIL_BYTES = 4096;
 const KILL_GRACE_MS = 1_000;
 const LEDGER_RETENTION_MS = 7 * 24 * 3600 * 1000;
+const WAKE_TAIL_BYTES = 2000;
+const RELAY_CLI = "agent-relay";
 
 const SERVICE_TIMEOUT_HINT = "A service meant to outlive the session needs 86400 — the default is a runaway guard, not a lifespan.";
 
 type ReapPolicy = "on-owner-exit" | "deadline";
 type TaskStatus = "running" | "exited" | "timedout" | "killed" | "lost";
+type WakeState = "on" | "off" | "unavailable";
+type WakeDecision = { state: WakeState; note: string };
 
 type Task = {
 	id: string;
@@ -44,6 +50,8 @@ type Task = {
 	mode: string;
 	sessionKey: string;
 	reapPolicy: ReapPolicy;
+	wake: WakeState;
+	wakeNote: string;
 	killTimer: ReturnType<typeof setTimeout> | undefined;
 	exited: boolean;
 	exitCode: number | null;
@@ -67,6 +75,8 @@ type Ledger = {
 	mode: string;
 	sessionKey: string;
 	reapPolicy: ReapPolicy;
+	wake?: WakeState;
+	wakeNote?: string;
 	owner: { pid: number; startTicks: string | undefined; mode: string; sessionKey: string };
 	ownerExitedAt?: number;
 	status: TaskStatus;
@@ -142,6 +152,121 @@ function pidAlive(pid: number | undefined, startTicks?: string): boolean {
 	}
 }
 
+function commandInPath(name: string): boolean {
+	for (const dir of (process.env.PATH ?? "").split(":").filter(Boolean)) {
+		const candidate = join(dir, name);
+		try {
+			if (!statSync(candidate).isFile()) continue;
+			accessSync(candidate, constants.X_OK);
+			return true;
+		} catch {}
+	}
+	return false;
+}
+
+function relayIdentity(): { platform: string; key: string } {
+	return { platform: process.env.AGENT_RELAY_PLATFORM ?? "", key: process.env.AGENT_RELAY_KEY ?? "" };
+}
+
+const WAKE_UNAVAILABLE = "PATH 里没有 agent-relay";
+const WAKE_NO_KEY = "缺少会话标识";
+
+function resolveWake(requested: boolean | undefined): WakeDecision {
+	const { platform, key } = relayIdentity();
+	const hasSession = platform !== "" && key !== "";
+	const reachable = commandInPath(RELAY_CLI);
+	if (requested === false) return { state: "off", note: "" };
+	if (requested === true) {
+		if (!hasSession) return { state: "off", note: WAKE_NO_KEY };
+		return reachable ? { state: "on", note: "" } : { state: "unavailable", note: WAKE_UNAVAILABLE };
+	}
+	if (!hasSession || currentMode === "tui") return { state: "off", note: "" };
+	return reachable ? { state: "on", note: "" } : { state: "unavailable", note: WAKE_UNAVAILABLE };
+}
+
+function wakeReceipt(wake: WakeDecision): string {
+	if (wake.state === "on") return "wake=on: it wakes this conversation if it outlives the turn.";
+	if (wake.state === "unavailable") return `wake=unavailable（唤醒不可用：${wake.note}）`;
+	return wake.note ? `wake=off（${wake.note}）` : "wake=off";
+}
+
+function wakeShell(input: {
+	id: string;
+	name: string;
+	platform: string;
+	key: string;
+	ownerPid: number;
+	ownerTicks: string | undefined;
+	logPath: string;
+	wakeFile: string;
+	startedSeconds: number;
+}): string {
+	const q = shellQuote;
+	const ticks = q(input.ownerTicks ?? "");
+	return [
+		"",
+		`task_name=${q(input.name)}`,
+		`task_id=${q(input.id)}`,
+		`task_log=${q(input.logPath)}`,
+		`task_wake_file=${q(input.wakeFile)}`,
+		`task_wake_name=${q(`bg-${input.id}`)}`,
+		`task_platform=${q(input.platform)}`,
+		`task_key=${q(input.key)}`,
+		`task_start=${input.startedSeconds}`,
+		"retry_pause=${BG_RUN_WAKE_RETRY_SECONDS:-20}",
+		"cli_seconds=${BG_RUN_WAKE_CLI_SECONDS:-20}",
+		'case "$code" in',
+		"  124|137) note='，到点被杀' ;;",
+		"  *) note='' ;;",
+		"esac",
+		"owner_alive() {",
+		`  s=$(cat /proc/${input.ownerPid}/stat 2>/dev/null) || return 1`,
+		`  [ -z ${ticks} ] && return 0`,
+		"  s=${s#*) }",
+		"  set -- $s",
+		"  shift 19",
+		`  [ "$1" = ${ticks} ]`,
+		"}",
+		"wake() {",
+		"  owner_alive && return 0",
+		`  body=$(tail -c ${WAKE_TAIL_BYTES} "$task_log" | tr -d '\\000') || return 1`,
+		'  prompt="自动唤醒：后台任务 $task_name ($task_id) 已结束（rc=$code$note，耗时 $(( $(date +%s) - task_start ))s，日志 $task_log）。这不是用户发言。',
+		"它在上一轮 job 退出之后才结束，结果没有投递到会话。以下为日志尾部；需要完整内容用 bg_tail $task_id。",
+		"",
+		'$body"',
+		"  if ! command -v agent-relay >/dev/null 2>&1; then",
+		"    printf 'wake: cli-missing\\n' >> \"$task_log\"",
+		"    printf 'wake: rc=127\\n' >> \"$task_log\"",
+		"    printf '127\\n' > \"$task_wake_file\"",
+		"    return 0",
+		"  fi",
+		"  i=0",
+		"  while :; do",
+		"    out=$(printf '%s\\n' \"$prompt\" | timeout \"$cli_seconds\" agent-relay schedule --platform \"$task_platform\" --key \"$task_key\" --name \"$task_wake_name\" --in 0s 2>&1)",
+		"    rcx=$?",
+		"    printf 'wake: rc=%s %s\\n' \"$rcx\" \"$out\" >> \"$task_log\"",
+		'    [ "$rcx" = 1 ] && [ "$i" -lt 2 ] || break',
+		"    i=$((i + 1))",
+		"    sleep $((i * retry_pause))",
+		"  done",
+		'  case "$rcx" in',
+		"    0) label=ok ;;",
+		"    1) label=daemon-down ;;",
+		"    3) label=refused ;;",
+		"    124) label=cli-timeout ;;",
+		"    126) label=cli-not-executable ;;",
+		"    127) label=cli-missing ;;",
+		"    *) label=failed ;;",
+		"  esac",
+		"  printf 'wake: %s\\n' \"$label\" >> \"$task_log\"",
+		"  printf '%s\\n' \"$rcx\" > \"$task_wake_file\"",
+		"  return 0",
+		"}",
+		"wake || { printf 'wake: failed\\n' >> \"$task_log\"; printf 'failed\\n' > \"$task_wake_file\"; }",
+		"",
+	].join("\n");
+}
+
 const BgRunParams = Type.Object({
 	command: Type.String({ description: "Shell command to run in the background" }),
 	name: Type.Optional(
@@ -150,6 +275,12 @@ const BgRunParams = Type.Object({
 	timeoutSeconds: Type.Optional(
 		Type.Number({
 			description: `Kill the task after this many seconds; default ${DEFAULT_TIMEOUT_SECONDS}, max ${MAX_TIMEOUT_SECONDS}. ${SERVICE_TIMEOUT_HINT}`,
+		}),
+	),
+	wakeOnExit: Type.Optional(
+		Type.Boolean({
+			description:
+				"Wake this conversation when the task ends after the owning job has exited. Defaults on in a relay session that can reach agent-relay; pass false for short or probe-only commands.",
 		}),
 	),
 });
@@ -256,6 +387,10 @@ function exitPath(id: string): string {
 	return join(LOG_DIR, `${id}.exit`);
 }
 
+function wakePath(id: string): string {
+	return join(LOG_DIR, `${id}.wake`);
+}
+
 function writeLedger(ledger: Ledger): void {
 	try {
 		mkdirSync(LOG_DIR, { recursive: true });
@@ -313,6 +448,8 @@ function ledgerFromTask(task: Task): Ledger {
 		mode: task.mode,
 		sessionKey: task.sessionKey,
 		reapPolicy: task.reapPolicy,
+		wake: task.wake,
+		wakeNote: task.wakeNote || undefined,
 		owner: { pid: process.pid, startTicks: readStat(process.pid), mode: task.mode, sessionKey: task.sessionKey },
 		status: task.timedOut ? "timedout" : task.exited ? (task.signal ? "killed" : "exited") : "running",
 		exitCode: task.exitCode,
@@ -404,7 +541,7 @@ function cleanupOldLogs(): void {
 		} catch {}
 	}
 	for (const file of readdirSync(LOG_DIR)) {
-		if (!/^[0-9a-f]{8}\.(json|exit)$/.test(file)) continue;
+		if (!/^[0-9a-f]{8}\.(json|exit|wake)$/.test(file)) continue;
 		const path = join(LOG_DIR, file);
 		try {
 			if (statSync(path).mtimeMs >= cutoff) continue;
@@ -537,11 +674,26 @@ export default function (pi: ExtensionAPI) {
 			const exitFile = exitPath(id);
 			const logFd = openSync(logPath, "a");
 			const reapPolicy: ReapPolicy = currentMode === "tui" ? "on-owner-exit" : "deadline";
+			const wake = resolveWake(params.wakeOnExit);
+			const startedAt = Date.now();
+			const wakeStep =
+				wake.state === "on"
+					? wakeShell({
+							id,
+							name,
+							...relayIdentity(),
+							ownerPid: process.pid,
+							ownerTicks: readStat(process.pid),
+							logPath,
+							wakeFile: wakePath(id),
+							startedSeconds: Math.floor(startedAt / 1000),
+						})
+					: "";
 			const usesTimeout = supportsForegroundTimeout();
 			const inner = usesTimeout
 				? `timeout --foreground -k 5 ${timeoutSeconds} ${shell} -c ${shellQuote(params.command)}`
 				: `${shell} -c ${shellQuote(params.command)}`;
-			const script = `${inner}; code=$?; printf '%s %s\\n' "$code" "$(date +%s)" > ${shellQuote(exitFile)}; if [ "$code" = 124 ] || [ "$code" = 137 ]; then kill -KILL 0 2>/dev/null; fi`;
+			const script = `${inner}; code=$?; printf '%s %s\\n' "$code" "$(date +%s)" > ${shellQuote(exitFile)}; ${wakeStep}if [ "$code" = 124 ] || [ "$code" = 137 ]; then kill -KILL 0 2>/dev/null; fi`;
 			const child = spawn(shell, ["-c", script], {
 				detached: true,
 				stdio: ["ignore", logFd, logFd],
@@ -555,12 +707,14 @@ export default function (pi: ExtensionAPI) {
 				pid: child.pid,
 				pgid: child.pid,
 				startTicks: child.pid === undefined ? undefined : readStat(child.pid),
-				startedAt: Date.now(),
-				deadlineAt: Date.now() + timeoutSeconds * 1000,
+				startedAt,
+				deadlineAt: startedAt + timeoutSeconds * 1000,
 				timeoutSeconds,
 				mode: currentMode,
 				sessionKey: currentSessionKey,
 				reapPolicy,
+				wake: wake.state,
+				wakeNote: wake.note,
 				killTimer: undefined,
 				exited: false,
 				exitCode: null,
@@ -608,10 +762,10 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Started ${name} (${id}), pid ${child.pid}, shell ${shell}, deadline ${timeoutSeconds}s, log ${logPath}. A finished job reports itself as its own message.`,
+						text: `Started ${name} (${id}), pid ${child.pid}, shell ${shell}, deadline ${timeoutSeconds}s, log ${logPath}. ${wakeReceipt(wake)} A finished job reports itself as its own message.`,
 					},
 				],
-				details: { id, pid: child.pid, shell },
+				details: { id, pid: child.pid, shell, wake: wake.state },
 			};
 		},
 	});
