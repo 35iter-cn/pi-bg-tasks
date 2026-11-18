@@ -99,6 +99,7 @@ test("start receipt is identical in tui and print", () => {
 		await bgStop(run.details.id);
 		`,
 			{},
+			{ AGENT_RELAY_PLATFORM: "", AGENT_RELAY_KEY: "" },
 		);
 	const tui = receipt("tui");
 	const print = receipt("print");
@@ -563,7 +564,7 @@ test("TC-BW1 a task that outlives its job schedules one wake round into the same
 	);
 	await new Promise((res) => setTimeout(res, 4500));
 	const record = readFileSync(w.record, "utf8");
-	assert.match(record, new RegExp(`^argv schedule --platform fake --key th-wake --name bg-${started.id} --in 0s$`, "m"));
+	assert.match(record, new RegExp(`^argv schedule --platform fake --key th-wake --name bg-${started.id} --in 0s --join$`, "m"));
 	assert.match(record, new RegExp(`自动唤醒：后台任务 wake-me \\(${started.id}\\) 已结束（rc=0，耗时 \\d+s`));
 	assert.match(record, /它在上一轮 job 退出之后才结束/);
 	assert.match(record, /bg_tail [0-9a-f]{8}/);
@@ -573,7 +574,7 @@ test("TC-BW1 a task that outlives its job schedules one wake round into the same
 	assert.equal(ledgerOf(w.bg, started.id).wake, "on");
 });
 
-test("TC-BW2 a task that ends while its job is still alive does not wake", { timeout: 60_000 }, async () => {
+test("TC-BW2 a task that ends while its job is still alive is still reported, and relay merges it", { timeout: 60_000 }, async () => {
 	const w = wakeFixture({ PATH: BARE_PATH, AGENT_RELAY_PLATFORM: "fake", AGENT_RELAY_KEY: "th-wake" });
 	w.env.PATH = `${w.bin}:${BARE_PATH}`;
 	const r = scenario(
@@ -587,8 +588,9 @@ test("TC-BW2 a task that ends while its job is still alive does not wake", { tim
 		w.env,
 	);
 	assert.match(r.receipt, /wake=on/);
-	assert.equal(existsSync(w.record), false);
-	assert.equal(wakeFileOf(w.bg, r.id), null);
+	const record = readFileSync(w.record, "utf8");
+	assert.match(record, new RegExp(`^argv schedule --platform fake --key th-wake --name bg-${r.id} --in 0s --join$`, "m"));
+	assert.equal(wakeFileOf(w.bg, r.id), "0");
 	assert.equal(ledgerOf(w.bg, r.id).wake, "on");
 });
 
@@ -612,7 +614,7 @@ test("TC-BW3 wakeOnExit false keeps the conversation out of it", { timeout: 60_0
 });
 
 test("TC-BW4 an interactive session neither wakes nor logs a wake line", { timeout: 60_000 }, async () => {
-	const w = wakeFixture();
+	const w = wakeFixture({ PATH: BARE_PATH, AGENT_RELAY_PLATFORM: "", AGENT_RELAY_KEY: "" });
 	w.env.PATH = `${w.bin}:${process.env.PATH ?? ""}`;
 	const started = scenario(
 		`

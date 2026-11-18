@@ -65,7 +65,7 @@ pi update --extensions
 | `command` | string, required | Shell command to run (via `/bin/sh -c`) |
 | `name` | string, optional | Short task name; defaults to the first words of the command |
 | `timeoutSeconds` | number, optional | Kill the task after this many seconds. Default 1800, max 86400. A service meant to outlive the session needs 86400 — the default is a runaway guard, not a lifespan |
-| `wakeOnExit` | boolean, optional | Wake this conversation when the task ends after the owning job has exited. Defaults on in a relay worker that can reach `agent-relay` — see [Waking the conversation](#waking-the-conversation) |
+| `wakeOnExit` | boolean, optional | Report the result back to this conversation when the task ends. Defaults on in a relay worker that can reach `agent-relay` — see [Waking the conversation](#waking-the-conversation) |
 
 Returns immediately with a task id, pid, and log path.
 
@@ -104,12 +104,12 @@ Kills tasks marked `on-owner-exit` whose owner is gone, kills tasks past their d
 
 ## Waking the conversation
 
-A chat bridge runs one pi process per turn, so a task started in that turn can end long after the process is gone. Inside a relay worker (`AGENT_RELAY_PLATFORM` and `AGENT_RELAY_KEY` both set, mode not `tui`, `agent-relay` on `PATH`) `bg_run` appends a wake step to the task's own shell: when the command ends, the step compares `/proc/<owner>/stat` field 22 with the start ticks recorded at spawn, and if the owning process is gone it runs `agent-relay schedule --in 0s` against the same conversation key. The scheduled round resumes the same session, so the result comes back to the conversation that started the task.
+A chat bridge runs one long-lived pi process per conversation, so a task can end either during the turn that started it or long after. Inside a relay worker (`AGENT_RELAY_PLATFORM` and `AGENT_RELAY_KEY` both set, mode not `tui`, `agent-relay` on `PATH`) `bg_run` appends a wake step to the task's own shell: when the command ends, the step runs `agent-relay schedule --in 0s --join` against the same conversation key. Relay decides what that means — if the conversation is mid-turn the result is steered into it, otherwise it starts a round on the same session. Either way the result comes back to the conversation that started the task, and the extension itself sends nothing in that mode.
 
 | Situation | Behaviour |
 |---|---|
-| Task ends, owner alive | no wake — the in-turn steering message already delivered it |
-| Task ends, owner gone | one wake round; its prompt starts with `自动唤醒` and carries rc, elapsed seconds and the last 2 KB of the log |
+| Task ends mid-turn | the result is steered into the running turn; no second message |
+| Task ends after the turn | one wake round on the same session; the body starts with `自动唤醒` and carries rc, elapsed seconds and the last 2 KB of the log |
 | Not a relay worker (interactive pi, `tui`) | `wake=off` in the start receipt; no wake step exists |
 | `wakeOnExit: false` | off on request, even in a relay worker |
 | No `agent-relay` on `PATH` at `bg_run` | `wake=unavailable` in the receipt and the ledger; nothing runs at exit |
